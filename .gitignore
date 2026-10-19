@@ -1,0 +1,11 @@
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+bin/
+obj/
+third_party/
+__pycache__/
+dist/

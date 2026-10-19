@@ -1,0 +1,11 @@
+LIBRARY dxgi
+EXPORTS
+    CreateDXGIFactory
+    CreateDXGIFactory1
+    CreateDXGIFactory2
+    DxrStages_ApiVersion
+    DxrStages_Register
+    DxrStages_Redraw
+    DxrStages_SessionName
+    S2fmRtao_Get
+    S2fmRtao_Set

@@ -1,0 +1,207 @@
+diff --git a/source/runtime.cpp b/source/runtime.cpp
+index 9ad4b62..d7e6def 100644
+--- a/source/runtime.cpp
++++ b/source/runtime.cpp
+@@ -985,6 +985,126 @@ void reshade::runtime::on_present()
+ #endif
+ }
+ 
++void reshade::runtime::s2fm_begin_frame(const s2fm_clock &clock)
++{
++	if (!_is_initialized)
++		return;
++
++	// update_effects loads every effect when the frame count is 0, so it sees the count of frames begun.
++	_frame_count = _s2fm_frames++;
++	update_effects();
++
++	_current_time = std::chrono::system_clock::now();
++	_last_present_time = _start_time + std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double>(clock.seconds));
++	_last_frame_duration = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double, std::milli>(clock.frame_time_ms));
++	_frame_count = clock.frame_count;
++	std::srand(clock.random_seed);
++}
++
++void reshade::runtime::s2fm_render_stage(api::command_list *cmd_list, api::resource_view rtv, api::resource_view rtv_srgb, const std::vector<bool> &techniques)
++{
++	if (!_is_initialized)
++		return;
++
++	capture_state(cmd_list, _app_state);
++	_s2fm_filter = &techniques;
++	_effects_rendered_this_frame = false;
++	render_effects(cmd_list, rtv, rtv_srgb);
++	_s2fm_filter = nullptr;
++	apply_state(cmd_list, _app_state);
++}
++
++size_t reshade::runtime::s2fm_technique_index(api::effect_technique handle) const
++{
++	return reinterpret_cast<const technique *>(handle.handle) - _techniques.data();
++}
++size_t reshade::runtime::s2fm_technique_count() const
++{
++	return _techniques.size();
++}
++reshade::runtime::s2fm_technique_facts reshade::runtime::s2fm_technique_info(api::effect_technique handle) const
++{
++	s2fm_technique_facts facts;
++	const technique *tech = reinterpret_cast<const technique *>(handle.handle);
++	if (tech == nullptr || tech->effect_index >= _effects.size())
++		return facts;
++	const effect &effect = _effects[tech->effect_index];
++	facts.name = tech->name;
++	facts.file = effect.source_file.filename().u8string();
++	facts.compiled = effect.compiled;
++	if (effect.permutations.empty() || tech->permutations.empty())
++		return facts;
++	const reshadefx::effect_module &module = effect.permutations[0].module;
++	const auto declared_name = [&module](const std::string &unique_name, std::string *semantic) -> std::string {
++		for (const reshadefx::texture &tex : module.textures)
++			if (tex.unique_name == unique_name)
++				return *semantic = tex.semantic, tex.name;
++		return *semantic = std::string(), unique_name;
++	};
++	for (const reshadefx::pass &pass : tech->permutations[0].passes)
++	{
++		for (const reshadefx::texture_binding &binding : pass.texture_bindings)
++		{
++			if (binding.index >= module.samplers.size())
++				continue;
++			std::string semantic;
++			const std::string name = declared_name(module.samplers[binding.index].texture_name, &semantic);
++			if (semantic == "DEPTH")
++				facts.reads_depth = true;
++			else if (semantic.empty() && std::find(facts.reads.begin(), facts.reads.end(), name) == facts.reads.end())
++				facts.reads.push_back(name);
++		}
++		for (const std::string &target : pass.render_target_names)
++		{
++			std::string semantic;
++			if (!target.empty())
++			{
++				const std::string name = declared_name(target, &semantic);
++				if (semantic.empty() && std::find(facts.writes.begin(), facts.writes.end(), name) == facts.writes.end())
++					facts.writes.push_back(name);
++			}
++		}
++		for (const reshadefx::storage_binding &binding : pass.storage_bindings)
++		{
++			if (binding.index >= module.storages.size())
++				continue;
++			std::string semantic;
++			const std::string name = declared_name(module.storages[binding.index].texture_name, &semantic);
++			if (semantic.empty() && std::find(facts.writes.begin(), facts.writes.end(), name) == facts.writes.end())
++				facts.writes.push_back(name);
++		}
++	}
++	return facts;
++}
++std::vector<std::pair<std::string, std::string>> reshade::runtime::s2fm_effect_definitions(const std::string &effect_file) const
++{
++	for (const effect &effect : _effects)
++		if (effect.source_file.filename().u8string() == effect_file)
++			return effect.definitions;
++	return {};
++}
++std::string reshade::runtime::s2fm_effect_errors(const std::string &effect_file) const
++{
++	for (const effect &effect : _effects)
++		if (effect.source_file.filename().u8string() == effect_file)
++			return effect.errors;
++	return {};
++}
++std::string reshade::runtime::s2fm_errors() const
++{
++	std::string result;
++	for (const effect &effect : _effects)
++	{
++		if (effect.errors.empty() && (effect.compiled || effect.skipped))
++			continue;
++		result += effect.source_file.filename().u8string();
++		result += effect.compiled ? " (compiled):\n" : (effect.skipped ? " (skipped):\n" : " (FAILED):\n");
++		result += effect.errors;
++		result += '\n';
++	}
++	return result;
++}
++
+ void reshade::runtime::load_config()
+ {
+ 	const ini_file &config = ini_file::load_cache(_config_path);
+@@ -3437,13 +3557,17 @@ void reshade::runtime::load_effects(bool force_load_all)
+ 	num_splits = std::min(num_splits, static_cast<size_t>(4));
+ #endif
+ 
++	// S2FM: each thread takes the next file as it is free, rather than a run of the folder's files: the effects a preset
++	// uses sit together in their folders (often several in one collection), and in runs they compiled one after another on one
++	// thread (FFTBLOOM 4.8 s, then RTGI 1.4 s...) while the other threads had nothing to compile.
++	const auto next_file = std::make_shared<std::atomic<size_t>>(0);
++
+ 	// Keep track of the spawned threads, so the runtime cannot be destroyed while they are still running
+ 	for (size_t n = 0; n < num_splits; ++n)
+-		_worker_threads.emplace_back([this, effect_files, offset, num_splits, n, &preset, force_load_all]() {
++		_worker_threads.emplace_back([this, effect_files, offset, next_file, &preset, force_load_all]() {
+ 			// Abort loading when initialization state changes (indicating that 'on_reset' was called in the meantime)
+-			for (size_t i = 0; i < effect_files.size() && _is_initialized; ++i)
+-				if (i * num_splits / effect_files.size() == n)
+-					load_effect(effect_files[i], preset, offset + i, 0, force_load_all || effect_files[i].extension() == L".addonfx");
++			for (size_t i; _is_initialized && (i = (*next_file)++) < effect_files.size();)
++				load_effect(effect_files[i], preset, offset + i, 0, force_load_all || effect_files[i].extension() == L".addonfx");
+ 		});
+ }
+ bool reshade::runtime::reload_effect(size_t effect_index)
+@@ -4031,6 +4155,9 @@ void reshade::runtime::render_effects(api::command_list *cmd_list, api::resource
+ 
+ 		const size_t effect_index = tech.effect_index;
+ 
++		if (_s2fm_filter != nullptr && (technique_index >= _s2fm_filter->size() || !(*_s2fm_filter)[technique_index]))
++			continue;
++
+ 		if (!tech.enabled || (_should_save_screenshot && !tech.enabled_in_screenshot) || (!_effects_enabled && !_effects[effect_index].addon))
+ 			continue;
+ 
+diff --git a/source/runtime.hpp b/source/runtime.hpp
+index 5c204b2..612fec1 100644
+--- a/source/runtime.hpp
++++ b/source/runtime.hpp
+@@ -36,6 +36,30 @@ namespace reshade
+ 		void on_reset();
+ 		void on_present();
+ 
++		// S2FM (reshadetool/patches/0001): the frame is driven by S2FM's clock and drawn in stages, not at Present.
++		struct s2fm_clock { double seconds; uint64_t frame_count; uint32_t random_seed; float frame_time_ms; };
++		// What on_present does before it draws: finish loading what is ready, set the clock the special
++		// uniforms read (timer = seconds, framecount, frametime, the seed of random).
++		void s2fm_begin_frame(const s2fm_clock &clock);
++		// Renders the enabled techniques whose index is set in 'techniques', in the preset's order, into rtv,
++		// the application's state saved before and put back after.
++		void s2fm_render_stage(api::command_list *cmd_list, api::resource_view rtv, api::resource_view rtv_srgb, const std::vector<bool> &techniques);
++		// The preprocessor definitions every effect gets, in place of the ones the config file gives.
++		void s2fm_set_global_definitions(std::vector<std::pair<std::string, std::string>> definitions) { _global_preprocessor_definitions = std::move(definitions); }
++		const std::vector<std::pair<std::string, std::string>> &s2fm_global_definitions() const { return _global_preprocessor_definitions; }
++		// The index a technique handle has in the list s2fm_render_stage's filter is indexed by, and its length.
++		size_t s2fm_technique_index(api::effect_technique handle) const;
++		size_t s2fm_technique_count() const;
++		// Every effect that failed or warned: its file and what the compiler said, one block each.
++		std::string s2fm_errors() const;
++		// What a technique is, for placing it at a stage: its effect file, whether a pass samples the DEPTH
++		// semantic, the textures (by declared name) its passes sample and the ones they write.
++		struct s2fm_technique_facts { std::string name, file; bool reads_depth = false; bool compiled = false; std::vector<std::string> reads, writes; };
++		s2fm_technique_facts s2fm_technique_info(api::effect_technique handle) const;
++		// The preprocessor definitions an effect file uses, with their default values; and its errors.
++		std::vector<std::pair<std::string, std::string>> s2fm_effect_definitions(const std::string &effect_file) const;
++		std::string s2fm_effect_errors(const std::string &effect_file) const;
++
+ 		uint64_t get_native() const final { return _swapchain->get_native(); }
+ 
+ 		void get_private_data(const uint8_t guid[16], uint64_t *data) const final { return _swapchain->get_private_data(guid, data); }
+@@ -269,6 +293,8 @@ namespace reshade
+ 
+ 		bool _effects_enabled = true;
+ 		bool _effects_rendered_this_frame = false;
++		const std::vector<bool> *_s2fm_filter = nullptr;
++		uint64_t _s2fm_frames = 0; // frames begun: update_effects takes a frame count of 0 as the first, and loads
+ 		unsigned int _effects_key_data[4] = {};
+ 
+ 		std::chrono::system_clock::time_point _current_time;

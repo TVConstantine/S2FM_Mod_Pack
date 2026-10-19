@@ -1,0 +1,7 @@
+// The two shaders ReShade's runtime loads from its own module (runtime.cpp, the copy that puts a resolved
+// back buffer back) and the mipmap generator, compiled by build_core.cmd from third_party/reshade/res/shaders.
+#include "resource.h"
+
+IDR_COPY_PS             RCDATA                  "copy_ps.cso"
+IDR_FULLSCREEN_VS       RCDATA                  "fullscreen_vs.cso"
+IDR_MIPMAP_CS           RCDATA                  "mipmap_cs_5_0.cso"
