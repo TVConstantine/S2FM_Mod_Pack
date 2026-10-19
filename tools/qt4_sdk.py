@@ -1,7 +1,8 @@
 """Prepares Qt 4.8.3 for building our own tool against the game's Qt, and checks it matches.
 
 The game ships Qt 4.8.3's DLLs and no headers or import libraries. This takes the headers from the
-official source package (third_party/qt-everywhere-opensource-src-4.8.3, see docs/tools), writes
+official source package (qt-everywhere-opensource-src-4.8.3 from https://download.qt.io/archive/qt/4.8/4.8.3/,
+unpacked into third_party/), writes
 the qconfig.h a Windows build of that version makes, and makes import libraries for x64 from the
 game's own QtCore4.dll and QtGui4.dll, so ordinary Qt code compiles and links against them.
 
@@ -24,7 +25,9 @@ import pefile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QT = os.path.join(ROOT, "third_party", "qt-everywhere-opensource-src-4.8.3")
 OUT = os.path.join(ROOT, "third_party", "qt4")
-GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Half-Life Alyx\game\bin\win64"
+# The game's bin\win64; S2FM_GAME_BIN when the game is not in Steam's default folder.
+GAME = os.environ.get("S2FM_GAME_BIN",
+                      r"C:\Program Files (x86)\Steam\steamapps\common\Half-Life Alyx\game\bin\win64")
 VCVARS = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 # What configure.exe writes for a shared, open source Windows build of 4.8 with every feature on

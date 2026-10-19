@@ -28,13 +28,17 @@ User instructions are in [installer/README.txt](installer/README.txt), which shi
 
 ## Building
 
-With Visual Studio 2026 (x64 tools), the Windows SDK and Python 3:
+With Visual Studio 2026 (x64 tools), the Windows SDK, Git, Python 3 with `pefile`, and the game installed:
 
-1. Once: `python tools/reshade_sdk.py` and `python tools/qt4_sdk.py` (ReShade 6.8.0's source with our patch, and
-   the Qt 4.8.3 headers, import libraries and moc, into `third_party/`).
+1. Once:
+   - `python tools/reshade_sdk.py`: ReShade 6.8.0's source with our patch, into `third_party/reshade`.
+   - Unpack Qt 4.8.3's source (`qt-everywhere-opensource-src-4.8.3` from
+     https://download.qt.io/archive/qt/4.8/4.8.3/) into `third_party/`, then `python tools/qt4_sdk.py`: the
+     headers, import libraries for the game's Qt DLLs, and moc. The game is looked for in Steam's default folder;
+     set `S2FM_GAME_BIN` to its `game\bin\win64` otherwise.
 2. `build_core.cmd`: `bin/core/dxgi.dll`.
 3. `build_reshade.cmd`: `reshade/bin/s2fm_reshade_core.dll`, the panel `reshade/bin/s2fm_reshade.dll` and
-   `reshade/bin/rs_harness.exe <test>`.
+   `reshade/bin/rs_harness.exe <test>` (`preset` and `assign` need `S2FM_TEST_PRESET` set to a preset file).
 4. `python tools/make_package.py`: `dist/S2FM_Mod_Pack_<version>.zip`.
 
 The version is in `package/version.h`.

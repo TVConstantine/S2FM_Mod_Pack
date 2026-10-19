@@ -196,9 +196,21 @@ static int TestClock() {
         && seedMatters ? 0 : 1;
 }
 
+// A preset of the user's for the two tests below, named by S2FM_TEST_PRESET; without it they are skipped (3).
+static bool UserPreset(fs::path& preset) {
+    char* v = nullptr;
+    size_t n = 0;
+    if (_dupenv_s(&v, &n, "S2FM_TEST_PRESET") == 0 && v) preset = v;
+    free(v);
+    if (!preset.empty() && fs::exists(preset)) return true;
+    printf("SKIP: set S2FM_TEST_PRESET to a preset file\n");
+    return false;
+}
+
 // The user's preset (a copy) against the user's shaders: which effects compile. Reported, passes if any did.
 static int TestUserPreset() {
-    const fs::path preset = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life Alyx\\game\\bin\\win64\\s2fmfirstpreset.ini";
+    fs::path preset;
+    if (!UserPreset(preset)) return 3;
     const fs::path copy = g_run / "user_preset_copy.ini";
     std::error_code ec;
     fs::create_directories(g_run, ec);
@@ -513,9 +525,10 @@ static int FindTechnique(const char* name) {
     return -1;
 }
 
-// The user's preset: each technique's stage by the rules, against what the design says.
+// The user's preset: each technique's stage by the rules, against what the design says for the effects it has.
 static int TestAssign() {
-    const fs::path preset = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life Alyx\\game\\bin\\win64\\s2fmfirstpreset.ini";
+    fs::path preset;
+    if (!UserPreset(preset)) return 3;
     const fs::path copy = g_run / "user_preset_copy.ini";
     std::error_code ec;
     fs::create_directories(g_run, ec);
@@ -665,6 +678,6 @@ int main(int argc, char** argv) {
     else if (!strcmp(t, "api_uniform")) r = TestApiUniform();
     else if (!strcmp(t, "image")) r = TestImage(argc, argv);
     else printf("FAIL: unknown test %s\n", t);
-    printf("%s %s\n", r == 0 ? "PASS" : "FAIL", t);
-    return r;
+    printf("%s %s\n", r == 0 ? "PASS" : r == 3 ? "SKIP" : "FAIL", t);
+    return r == 3 ? 0 : r;
 }
