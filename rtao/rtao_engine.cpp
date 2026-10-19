@@ -608,6 +608,9 @@ void TransRedraw(ID3D11DeviceContext* ctx, ContextState* st) {
 // more into a target of its own, with the engine's depth: once as it is, added, and once with g_vSelfIllumTintScaled
 // (the factor the shader multiplies its glow by, in the material's b0) set to zero, taken away. What is left is the
 // glow, by the engine's own formula, which the pass over the picture adds back times (1 - AO).
+// A glowing surface drawn before something that covers it (a character, which the engine's depth prepass lacks) is
+// still in the glow's target. So each glowing draw is drawn a third time, depth only, into a depth target of our own:
+// the nearest glowing surface at each pixel. The pass keeps the glow only where the scene's final depth is not nearer.
 ID3D11Texture2D* g_glowTex = nullptr;          // at the scene target's size and samples
 ID3D11RenderTargetView* g_glowRtv = nullptr;
 ID3D11Texture2D* g_glowOne = nullptr;          // resolved, one sample
@@ -620,6 +623,12 @@ ID3D11Buffer* g_glowCb = nullptr;              // the material's b0 with the glo
 UINT g_glowCbBytes = 0;
 std::vector<uint8_t> g_glowCbData;
 std::atomic<long long> g_glowDraws{0};
+ID3D11Texture2D* g_glowZTex = nullptr;          // the nearest glowing surface's depth, one sample, cleared to 1
+ID3D11DepthStencilView* g_glowZDsv = nullptr;
+ID3D11ShaderResourceView* g_glowZSrv = nullptr;
+ID3D11DepthStencilState* g_glowZState = nullptr;
+bool g_glowAll = false;      // "glowall": the glow added wherever it was drawn, as before
+bool g_finalDepth = false;   // this frame's depth slot has the scene's own depth, taken after the opaque surfaces
 
 void GlowPrepare(ID3D11DeviceContext* ctx) {
     g_glowUsed = false;
@@ -636,6 +645,7 @@ void GlowPrepare(ID3D11DeviceContext* ctx) {
     if (!g_glowTex || g_glowDesc.Width != d.Width || g_glowDesc.Height != d.Height
         || g_glowDesc.SampleDesc.Count != d.SampleDesc.Count || g_glowDesc.SampleDesc.Quality != d.SampleDesc.Quality) {
         Drop(g_glowRtv); Drop(g_glowTex); Drop(g_glowSrv); Drop(g_glowOne);
+        Drop(g_glowZDsv); Drop(g_glowZSrv); Drop(g_glowZTex);
         ID3D11Device* dev = nullptr;
         ctx->GetDevice(&dev);
         if (!dev) return;
@@ -659,6 +669,30 @@ void GlowPrepare(ID3D11DeviceContext* ctx) {
               && SUCCEEDED(dev->CreateShaderResourceView(g_glowOne, nullptr, &g_glowSrv));
         } else if (ok) {
             ok = SUCCEEDED(dev->CreateShaderResourceView(g_glowTex, nullptr, &g_glowSrv));
+        }
+        if (ok) {
+            D3D11_TEXTURE2D_DESC z = c;
+            z.Format = DXGI_FORMAT_R32_TYPELESS;
+            z.SampleDesc.Count = 1;
+            z.SampleDesc.Quality = 0;
+            z.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+            D3D11_DEPTH_STENCIL_VIEW_DESC dv = {};
+            dv.Format = DXGI_FORMAT_D32_FLOAT;
+            dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+            sv.Format = DXGI_FORMAT_R32_FLOAT;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sv.Texture2D.MipLevels = 1;
+            ok = SUCCEEDED(dev->CreateTexture2D(&z, nullptr, &g_glowZTex))
+              && SUCCEEDED(dev->CreateDepthStencilView(g_glowZTex, &dv, &g_glowZDsv))
+              && SUCCEEDED(dev->CreateShaderResourceView(g_glowZTex, &sv, &g_glowZSrv));
+        }
+        if (ok && !g_glowZState) {
+            D3D11_DEPTH_STENCIL_DESC dd = {};
+            dd.DepthEnable = TRUE;
+            dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+            dd.DepthFunc = D3D11_COMPARISON_LESS;
+            ok = SUCCEEDED(dev->CreateDepthStencilState(&dd, &g_glowZState));
         }
         for (int k = 0; k < 2 && ok; ++k) {
             if (g_glowBlend[k]) continue;
@@ -686,12 +720,14 @@ void GlowPrepare(ID3D11DeviceContext* ctx) {
         g_glowDesc = d;
         if (!ok) {
             Drop(g_glowRtv); Drop(g_glowTex); Drop(g_glowSrv); Drop(g_glowOne);
+            Drop(g_glowZDsv); Drop(g_glowZSrv); Drop(g_glowZTex);
             Log("[RTAO] the glow's target could not be made; glowing surfaces get the AO too");
             return;
         }
     }
     const FLOAT zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     ctx->ClearRenderTargetView(g_glowRtv, zero);
+    ctx->ClearDepthStencilView(g_glowZDsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
 }
 
 // After a reader is drawn: its glow into the glow's target, when its variant glows.
@@ -743,6 +779,17 @@ void GlowRedraw(ID3D11DeviceContext* ctx, ContextState* st) {
         ctx->PSSetConstantBuffers(0, 1, &g_glowCb);
         ctx->OMSetBlendState(g_glowBlend[1], one, 0xFFFFFFFFu);
         CoreRedraw(ctx, st);
+        ID3D11PixelShader* oldPs = nullptr;
+        ID3D11ClassInstance* psCi[256];
+        UINT psCiN = 256;
+        ctx->PSGetShader(&oldPs, psCi, &psCiN);
+        ctx->PSSetShader(nullptr, nullptr, 0);
+        ctx->OMSetRenderTargets(0, nullptr, g_glowZDsv);
+        ctx->OMSetDepthStencilState(g_glowZState, 0);
+        CoreRedraw(ctx, st);
+        ctx->PSSetShader(oldPs, psCi, psCiN);
+        if (oldPs) oldPs->Release();
+        for (UINT i = 0; i < psCiN; ++i) if (psCi[i]) psCi[i]->Release();
         g_glowUsed = true;
         g_glowDraws.fetch_add(1, std::memory_order_relaxed);
     }
@@ -790,6 +837,8 @@ const char kMulPs[] =
     "Texture2D<float4> g_Ao : register(t0);\n"
     "Texture2D<float4> g_SeeThrough : register(t1);\n"
     "Texture2D<float4> g_Glow : register(t7);\n"
+    "Texture2D<float> g_GlowZ : register(t8);\n"
+    "Texture2D<float> g_SceneZ : register(t9);\n"
     "#ifdef ADD_FOG\n"
     "Texture2D<float> g_Depth : register(t2);\n"
     "Texture3D<float4> g_FogVolume : register(t3);\n"
@@ -858,9 +907,11 @@ const char kMulPs[] =
     "struct Out { float4 add : SV_Target0; float4 mul : SV_Target1; };\n"
     "Out main(float4 pos : SV_Position) {\n"
     "    const float4 v = g_Ao.Load(int3(pos.xy, 0));\n"
+    "    float3 glow = max(g_Glow.Load(int3(pos.xy, 0)).rgb, 0.0f);\n"
+    // Unbound (no depth this frame) both read 0 and the glow is kept.
+    "    if (g_SceneZ.Load(int3(pos.xy, 0)) < g_GlowZ.Load(int3(pos.xy, 0)) - 1e-6f) glow = float3(0.0f, 0.0f, 0.0f);\n"
     "    Out o;\n"
-    "    o.add = float4((g_SeeThrough.Load(int3(pos.xy, 0)).rgb + max(g_Glow.Load(int3(pos.xy, 0)).rgb, 0.0f))\n"
-    "                   * (1.0f - v.r), 0.0f);\n"
+    "    o.add = float4((g_SeeThrough.Load(int3(pos.xy, 0)).rgb + glow) * (1.0f - v.r), 0.0f);\n"
     "#ifdef ADD_FOG\n"
     "    if (v.r < 1.0f) o.add.rgb += FogKept(pos.xy) * (1.0f - v.r);\n"
     "#endif\n"
@@ -962,8 +1013,8 @@ void MultiplyNow(ID3D11DeviceContext* ctx) {
     ID3D11ClassInstance* psCi[256];
     UINT psCiN = 256;
     ctx->PSGetShader(&ps, psCi, &psCiN);
-    ID3D11ShaderResourceView* srv0[8] = {};
-    ctx->PSGetShaderResources(0, 8, srv0);
+    ID3D11ShaderResourceView* srv0[10] = {};
+    ctx->PSGetShaderResources(0, 10, srv0);
     ID3D11Buffer* cb0[7] = {};
     ctx->PSGetConstantBuffers(0, 7, cb0);
     ID3D11SamplerState* smp0[2] = {};
@@ -1021,10 +1072,13 @@ void MultiplyNow(ID3D11DeviceContext* ctx) {
     }
     ctx->PSSetShader(fog ? g_mulPsFog : g_mulPs, nullptr, 0);
     ID3D11ShaderResourceView* glow = g_debug ? nullptr : GlowForPass(ctx);
-    ID3D11ShaderResourceView* mine[8] = { shown.aoSrv, g_transUsed ? g_transSrv : nullptr, fog ? shown.depthSrv : nullptr,
-                                          fog ? g_fogTex[0] : nullptr, fog ? g_fogTex[1] : nullptr,
-                                          fog ? g_fogTex[2] : nullptr, fog ? before : nullptr, glow };
-    ctx->PSSetShaderResources(0, 8, mine);
+    ID3D11ShaderResourceView* sceneZ = glow && !g_glowAll && g_finalDepth && g_depthSlot >= 0 && g_glowZSrv
+                                     ? g_slots[g_depthSlot].depthSrv : nullptr;
+    ID3D11ShaderResourceView* mine[10] = { shown.aoSrv, g_transUsed ? g_transSrv : nullptr, fog ? shown.depthSrv : nullptr,
+                                           fog ? g_fogTex[0] : nullptr, fog ? g_fogTex[1] : nullptr,
+                                           fog ? g_fogTex[2] : nullptr, fog ? before : nullptr, glow,
+                                           sceneZ ? g_glowZSrv : nullptr, sceneZ };
+    ctx->PSSetShaderResources(0, 10, mine);
     ctx->RSSetState(g_mulRaster);
     D3D11_VIEWPORT vp = {};
     vp.Width = (FLOAT)g_sceneW;
@@ -1042,7 +1096,7 @@ void MultiplyNow(ID3D11DeviceContext* ctx) {
     ctx->OMSetBlendState(bs, bf, sm);
     ctx->RSSetViewports(nvp, vps);
     ctx->RSSetState(rs);
-    ctx->PSSetShaderResources(0, 8, srv0);
+    ctx->PSSetShaderResources(0, 10, srv0);
     ctx->PSSetConstantBuffers(0, 7, cb0);
     ctx->PSSetSamplers(0, 2, smp0);
     ctx->PSSetShader(ps, psCi, psCiN);
@@ -1171,6 +1225,67 @@ std::string DumpSlot(ID3D11DeviceContext* ctx, int k, UINT w, UINT h) {
     return out;
 }
 
+// "dump": where something glows this frame, and where the pass leaves that glow out because the scene's depth is
+// nearer than the glowing surface's (s2fm_rtao_glow.ppm: green kept, red left out).
+bool ReadBack(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, std::vector<uint8_t>& out, UINT& pitch) {
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    ID3D11Texture2D* st = nullptr;
+    bool ok = dev && SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &st)) && st;
+    if (dev) dev->Release();
+    if (!ok) return false;
+    ctx->CopyResource(st, src);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    ok = SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m));
+    if (ok) {
+        pitch = m.RowPitch;
+        out.assign((const uint8_t*)m.pData, (const uint8_t*)m.pData + (size_t)m.RowPitch * d.Height);
+        ctx->Unmap(st, 0);
+    }
+    st->Release();
+    return ok;
+}
+
+std::string GlowDump(ID3D11DeviceContext* ctx, int k, UINT w, UINT h) {
+    if (!g_glowUsed || !g_glowZTex || !g_finalDepth || k < 0) return " | glow: none this frame";
+    ID3D11Texture2D* glow = g_glowOne ? g_glowOne : g_glowTex;
+    if (g_glowOne) ctx->ResolveSubresource(g_glowOne, 0, g_glowTex, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    std::vector<uint8_t> gc, gz, sz;
+    UINT gp = 0, zp = 0, sp = 0;
+    if (!ReadBack(ctx, glow, gc, gp) || !ReadBack(ctx, g_glowZTex, gz, zp) || !ReadBack(ctx, g_slots[k].depth11, sz, sp))
+        return " | glow: could not be read";
+    if (w > g_glowDesc.Width) w = g_glowDesc.Width;
+    if (h > g_glowDesc.Height) h = g_glowDesc.Height;
+    long long glowing = 0, left = 0;
+    FILE* f = nullptr;
+    _wfopen_s(&f, CorePath(L"s2fm_rtao_glow.ppm").c_str(), L"wb");
+    if (f) fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (UINT y = 0; y < h; ++y)
+        for (UINT x = 0; x < w; ++x) {
+            const uint16_t* c = (const uint16_t*)(gc.data() + (size_t)y * gp) + x * 4;
+            const float g = HalfToFloat(c[0]) + HalfToFloat(c[1]) + HalfToFloat(c[2]);
+            const float zg = ((const float*)(gz.data() + (size_t)y * zp))[x];
+            const float zs = ((const float*)(sz.data() + (size_t)y * sp))[x];
+            uint8_t px[3] = { 0, 0, 0 };
+            if (g > 1e-3f) {
+                ++glowing;
+                if (zs < zg - 1e-6f) { ++left; px[0] = 255; } else px[1] = 255;
+            }
+            if (f) fwrite(px, 1, 3, f);
+        }
+    if (f) fclose(f);
+    char b[120];
+    sprintf_s(b, " | glow: %.2f%% of the pixels, %.2f%% left out (covered)", 100.0 * glowing / ((double)w * h),
+              100.0 * left / ((double)w * h));
+    return b;
+}
+
 // --- The rays, at the place the AO goes on: the scene's depth over t9, our queue told to wait for it and the capture,
 // the AO traced, the engine's context told to wait for it. Nothing on the CPU waits.
 // The camera of this frame as a place and a direction: its position and where it looks (the projection's w column,
@@ -1197,12 +1312,14 @@ void Unready(const char* why);   // below
 
 void Fire(ID3D11DeviceContext* ctx) {
     g_showSlot = -1;
+    g_finalDepth = false;
     const int k = g_depthSlot;
     const UINT vertices = RtaoCaptureVertices();
     if (k < 0 || !g_camValid) { g_missed.fetch_add(1, std::memory_order_relaxed); return; }
     const UINT w = g_sceneW < g_slotW ? g_sceneW : g_slotW;
     const UINT h = g_sceneH < g_slotH ? g_sceneH : g_slotH;
     const bool sceneDepth = !g_t9Depth && CopySceneDepth(ctx, k, w, h);
+    g_finalDepth = sceneDepth;
     if (!sceneDepth && !g_depthFromT9) {
         // No depth for the rays at all (no t9 and the scene's could not be copied).
         Unready("the scene's depth could not be copied and there is no t9");
@@ -1294,7 +1411,7 @@ void Fire(ID3D11DeviceContext* ctx) {
     }
     if (g_dumpWanted && !g_dumpDone && g_showSlot >= 0 && GetTickCount64() >= g_dumpAfter) {
         g_dumpDone = true;
-        g_dumpLine = DumpSlot(ctx, g_showSlot, w, h);
+        g_dumpLine = DumpSlot(ctx, g_showSlot, w, h) + GlowDump(ctx, k, w, h);
         char rb[96];
         sprintf_s(rb, " | viewport depth range %.3f to %.3f, %u triangles", g_minDepth, g_maxDepth, vertices / 3);
         g_dumpLine += rb;
@@ -1742,6 +1859,7 @@ void ReadSwitch(ULONGLONG now) {
     g_noRefit = line.find("norefit") != std::string::npos;
     g_solidBlended = line.find("solidblended") != std::string::npos;
     g_withSky = line.find("withsky") != std::string::npos;
+    g_glowAll = line.find("glowall") != std::string::npos;
     g_noT9 = line.find("not9") != std::string::npos;
     if (g_noT9 && g_t9) {
         Drop(g_t9);

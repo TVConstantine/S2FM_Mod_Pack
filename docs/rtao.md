@@ -22,7 +22,8 @@ Ray traced ambient occlusion in S2FM's own viewports and renders.
    A map's 3D sky is left out too: the engine draws it with the camera's matrix but in the last part of the depth
    range (0.95 to 1), scaled up round the map, and its huge terrain would cross the real ground.
 6. **Applied.** After the opaque surfaces, one full screen pass multiplies the picture by the AO. What fog, glowing
-   surfaces and see-through draws add is kept out of the AO.
+   surfaces and see-through draws add is kept out of the AO. A glowing surface's glow is kept out only where it is
+   still in front at the end: a character drawn after it covers it.
 
 The two devices meet only through shared fences, so the CPU never waits for the card.
 
@@ -49,6 +50,7 @@ The first line of `s2fm_rtao_debug.txt` beside `dxgi.dll` (read four times a sec
 | `flatnormals` | turn the AO by the faces' normals instead of the smooth ones |
 | `solidblended` | trace blended draws as solid |
 | `withsky` | trace the map's 3D sky too |
+| `glowall` | add the glow of glowing surfaces even where something drawn later covers them |
 | `not9` | ignore the engine's AO depth, as in a scene of models alone |
 | `views` | log every view the engine draws for a few frames |
 | `offscreen` | also take the shadow view's geometry (see below) |
