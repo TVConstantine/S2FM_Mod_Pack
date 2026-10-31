@@ -72,15 +72,42 @@ void Wait() {
 }
 }  // namespace
 
+// The words of s2fm_mods_dev.txt, read once ("" without it).
+const char* DevWords() {
+    static char words[256] = {};
+    static std::atomic<bool> read{false};
+    if (!read.exchange(true)) {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, CorePath(L"s2fm_mods_dev.txt").c_str(), L"r") == 0 && f) {
+            fread(words, 1, sizeof(words) - 1, f);
+            fclose(f);
+        }
+    }
+    return words;
+}
+
+// "nofeatures": no feature starts, the core alone runs (with the Python layer when asked), to tell whether something
+// the game does wrong is a feature's doing.
+bool CoreDevNoFeatures() {
+    return strstr(DevWords(), "nofeatures") != nullptr;
+}
+
+// "noassetfix": the asset system's up-to-date check is left as the game has it (assets/asset_deps.cpp), for a run to
+// set beside one with the fixes.
+bool CoreDevNoAssetFix() {
+    return strstr(DevWords(), "noassetfix") != nullptr;
+}
+
+// "nowipefix": the G-Man's "no-wipe" models drawn in the wipe's later layers as the game has it
+// (refraction/no_wipe.cpp).
+bool CoreDevNoWipeFix() {
+    return strstr(DevWords(), "nowipefix") != nullptr;
+}
+
 void CoreDevStart() {
     static std::atomic<bool> once{false};
     if (once.exchange(true)) return;
-    FILE* f = nullptr;
-    char words[256] = {};
-    if (_wfopen_s(&f, CorePath(L"s2fm_mods_dev.txt").c_str(), L"r") != 0 || !f) return;
-    fread(words, 1, sizeof(words) - 1, f);
-    fclose(f);
-    if (!strstr(words, "python")) return;
+    if (!strstr(DevWords(), "python")) return;
     Log("[DEV] s2fm_mods_dev.txt asks for the Python layer: it starts once S2FM's main window is up\n");
     std::thread(Wait).detach();
 }

@@ -30,7 +30,8 @@ $Files = @(
 )
 # Made by the mods while the game runs; removed on uninstall.
 $Made = @("game\bin\win64\s2fm_shader_table.bin", "game\bin\win64\s2fm_shader_table.bin.part",
-          "game\bin\win64\s2fm_mods.log", "game\bin\win64\tools\s2fm_reshade_tool.log")
+          "game\bin\win64\s2fm_mods.log", "game\bin\win64\s2fm_mods.previous.log",
+          "game\bin\win64\tools\s2fm_reshade_tool.log")
 # Kept on uninstall unless -Purge.
 $UserData = @("game\bin\win64\s2fm_reshade", "game\bin\win64\s2fm_rtao.ini", "game\bin\win64\s2fm_mods_crash")
 $Backup = "game\bin\win64\s2fm_mods_backup"

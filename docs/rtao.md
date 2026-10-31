@@ -46,6 +46,7 @@ The first line of `s2fm_rtao_debug.txt` beside `dxgi.dll` (read four times a sec
 | `measure` | picture means and timings into `s2fm_rtao_out.txt` |
 | `dump` | with `measure`: the AO, depth and picture as image files |
 | `norefit` | rebuild the structure every frame |
+| `regrow` | remake the capture and structure buffers every 30th frame (tests the growth while the rays are behind) |
 | `nocutouts`, `solidcutouts` | leave cut outs out, or trace them as solid |
 | `flatnormals` | turn the AO by the faces' normals instead of the smooth ones |
 | `solidblended` | trace blended draws as solid |

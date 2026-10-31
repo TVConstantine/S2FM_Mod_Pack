@@ -22,6 +22,7 @@
 void CoreViewsPresent(IDXGISwapChain* sc);   // core_views.cpp
 void CoreTableStart();                        // core_table.cpp
 void CoreDevStart();                          // core_dev.cpp
+bool CoreDevNoFeatures();                     // core_dev.cpp
 void CoreFeaturesInit();                      // package/features.cpp
 uint32_t CoreTableGen();
 
@@ -455,6 +456,7 @@ typedef void(STDMETHODCALLTYPE* Update_Fn)(ID3D11DeviceContext*, ID3D11Resource*
                                           UINT, UINT);
 void STDMETHODCALLTYPE H_UpdateSubresource(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box,
                                            const void* data, UINT rowPitch, UINT depthPitch) {
+    if (data && !t_CorePassThrough) EACH_FEATURE(updating, c, r, box, data);
     if (data) {
         if (Shadow* s = ShadowOf(r)) {
             const size_t size = s->data.size();
@@ -693,7 +695,8 @@ void LoadRealDxgi() {
             CloseHandle(snap);
         }
     }
-    CoreFeaturesInit();
+    if (CoreDevNoFeatures()) Log("[DEV] s2fm_mods_dev.txt says nofeatures: no feature starts\n");
+    else CoreFeaturesInit();
     CoreOnModuleLoad([] {});   // the library load watch on, for the start order
 }
 

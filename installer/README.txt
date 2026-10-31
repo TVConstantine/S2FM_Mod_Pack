@@ -7,6 +7,8 @@ Mods for Source 2 Filmmaker (Half-Life: Alyx Workshop Tools, the 6 May 2022 buil
   A after the opaque surfaces, B on every render sample, C on the finished picture.
 - Particle refraction (shock waves, heat haze) in S2FM's viewports.
 - RTAO: ray traced ambient occlusion in S2FM's viewports and renders.
+- For the s2vfx custom shaders: lights with a size, the weather's light, the sky's HDRI and the sky as light.
+- The G-Man's hair and eyes stay behind a refracting glass instead of drawing over it.
 
 
 Requirements
@@ -109,6 +111,19 @@ RTAO
 
 RTAO is switched on and off in the ReShade panel (top right), where the rays per pixel are set too. How far and how
 dark it reaches is set by the camera's SSAO Radius, Bias and Strength in S2FM.
+
+
+For the s2vfx shaders
+---------------------
+
+Nothing to set up; with the s2vfx shaders installed:
+
+- A light's Radius in S2FM gives s2vfx_lit soft, wide highlights (the engine knows only points).
+- s2vfx_weather takes each light's own fog setting and is drawn before the particles.
+- A sky drawn with s2vfx_sky is written, whenever its settings change, as an equirectangular .hdr (2048 x 1024, laid
+  out as Blender's world texture) into game\bin\win64\s2fm_sky\, one file a look.
+- The same sky, without its sun's disk, lights the s2vfx materials whose Sky Light is above 0 (ambient and
+  reflections). The map's surfaces keep the map's light.
 
 
 Crash reports

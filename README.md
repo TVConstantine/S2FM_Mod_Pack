@@ -7,8 +7,19 @@ Mods for Source 2 Filmmaker (Half-Life: Alyx Workshop Tools, the 6 May 2022 buil
 - **Particle refraction** in S2FM's viewports (the frame copy the game leaves out).
 - **RTAO**, ray traced ambient occlusion in S2FM's viewports and renders, driven by the camera's SSAO settings.
   Needs DirectX Raytracing 1.1; off on other cards.
+- **Fog** of its own, driven by the camera's fog controls and independent of the map ([docs/fog.md](docs/fog.md)).
+- **Water interaction**: ripples, foam and splashes where things touch a water, and wet models that drip.
+- **Support for custom shaders**: the scene's depth and a frame copy for see-through surfaces, weather volumes
+  sorted before the particles, lights with a size, and a procedural sky baked into an HDRI and given back as light.
 
-All three run in one `dxgi.dll` placed beside the game (see [docs/why_dxgi.md](docs/why_dxgi.md)).
+All of it runs in one `dxgi.dll` placed beside the game (see [docs/why_dxgi.md](docs/why_dxgi.md)).
+
+## New in 1.1.0: the s2vfx shaders and compiler
+
+The [1.1.0 release](https://github.com/TVConstantine/S2FM_Mod_Pack/releases/tag/v1.1.0) also carries seven
+custom shaders for S2FM (lit, unlit, glass, water, energy, weather, sky) with example materials, texture sets and a
+manual (`Manual.html`), and the s2vfx compiler with its source, which builds shaders like them from `.vfx` files.
+The shaders and the compiler are under the BSD 3-Clause license too.
 
 User instructions are in [installer/README.txt](installer/README.txt), which ships in the package.
 
@@ -19,7 +30,10 @@ User instructions are in [installer/README.txt](installer/README.txt), which shi
 | `core/` | the `dxgi.dll` core: D3D11 hooks, constant buffer copies, views, crash reports |
 | `common/` | the shader table (built from the game's `.vcs` files), the S2FM document reader |
 | `reshade/` | ReShade's stages (`stages.cpp`), the ReShade core (`core/`), the panel (`tool/`), tests (`harness/`) |
-| `refraction/` | particle refraction and its blur |
+| `refraction/` | particle refraction and its blur, the scene's depth for custom shaders, water interaction, weather sorting, glass fixes |
+| `fog/` | the camera's fog |
+| `sky/` | the sky's HDRI bake and Sky Light |
+| `assets/` | asset system fixes (custom shaders' materials in an addon compiled once) |
 | `rtao/` | RTAO: capture, D3D12 rays, the pass over the picture ([docs/rtao.md](docs/rtao.md)) |
 | `package/` | which features the core registers, the version |
 | `installer/` | `Install.bat`, `Uninstall.bat`, `s2fm_mods.ps1`, the user readme |

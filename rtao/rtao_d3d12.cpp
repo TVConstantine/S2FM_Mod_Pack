@@ -68,7 +68,9 @@ ID3D12Resource* g_tlas = nullptr;
 UINT64 g_tlasBytes = 0;
 ID3D12Resource* g_scratch = nullptr;
 UINT64 g_scratchBytes = 0;
-ID3D12Resource* g_instance = nullptr;   // upload heap, one D3D12_RAYTRACING_INSTANCE_DESC
+// Upload heap, one D3D12_RAYTRACING_INSTANCE_DESC per list: a list still waiting on the card builds its top level
+// from its own, so a bottom level that moves (grown) under the next list is never what an older list points at.
+ID3D12Resource* g_instance[kLists] = {};
 ID3D12Resource* g_consts[kLists] = {};  // upload heap, 256 bytes each
 // The card's time for each part of a frame: timestamps before the conversion, after it, after the bottom and the top
 // structures and after the AO, per list, read back once the list has run; summed for the 10 s line.
@@ -98,6 +100,48 @@ char g_why[256] = "";
 
 template <typename T> void Drop(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
+// A resource the card may still be using is not released when it is replaced: it waits here, with the AO fence value
+// of the last list sent, until the card has passed that value. Releasing it at once let a list still running read
+// freed memory when the frame grew while the rays were behind (the driver reset the card and RTAO stopped).
+struct Retired {
+    IUnknown* p;
+    UINT64 after;
+};
+std::vector<Retired> g_retired;
+UINT64 g_lastSent = 0;     // the AO fence value the last list sent signals
+UINT g_regrowFrames = 0;   // "regrow": the frames traced with it on
+
+template <typename T> void Retire(T*& p) {
+    if (!p) return;
+    g_retired.push_back({ p, g_lastSent });
+    p = nullptr;
+}
+
+void ReleaseDone() {
+    if (g_retired.empty() || !g_aoFence12) return;
+    const UINT64 done = g_aoFence12->GetCompletedValue();
+    size_t kept = 0;
+    for (Retired& r : g_retired) {
+        if (r.after <= done) r.p->Release();
+        else g_retired[kept++] = r;
+    }
+    g_retired.resize(kept);
+}
+
+// Once: whether the card took our device away, and why, so that a stop is never silent.
+bool g_removedLogged = false;
+bool DeviceLost() {
+    const HRESULT why = g_dev ? g_dev->GetDeviceRemovedReason() : S_OK;
+    if (why == S_OK) return false;
+    if (!g_removedLogged) {
+        g_removedLogged = true;
+        Log("[RTAO] the card removed our D3D12 device (0x%08X); RTAO stops for this session", (unsigned)why);
+        sprintf_s(g_why, "the card removed the D3D12 device (0x%08X)", (unsigned)why);
+    }
+    g_ready = false;
+    return true;
+}
+
 void Fail(const char* what, HRESULT hr) {
     Log("[RTAO] %s failed (0x%08X); RTAO stays off for this session", what, (unsigned)hr);
     sprintf_s(g_why, "D3D12 could not be started (%s, 0x%08X)", what, (unsigned)hr);
@@ -124,7 +168,7 @@ ID3D12Resource* Buffer(UINT64 bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS 
 // A default heap buffer of at least bytes, grown by half again when it is made anew.
 bool Grow(ID3D12Resource*& r, UINT64& have, UINT64 need, D3D12_RESOURCE_STATES state) {
     if (r && have >= need) return true;
-    Drop(r);
+    Retire(r);
     const UINT64 bytes = (need + need / 2 + 65535) & ~65535ull;
     r = Buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, state);
     have = r ? bytes : 0;
@@ -303,9 +347,11 @@ bool Start(ID3D11Device* dev) {
                                  D3D12_RESOURCE_STATE_COPY_DEST);
         if (!g_stampRead || FAILED(g_queue->GetTimestampFrequency(&g_stampFreq))) g_stampFreq = 0;
     }
-    g_instance = Buffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
-                        D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!g_instance) { Fail("the instance", E_OUTOFMEMORY); return false; }
+    for (int i = 0; i < kLists; ++i) {
+        g_instance[i] = Buffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!g_instance[i]) { Fail("the instance", E_OUTOFMEMORY); return false; }
+    }
     if (!MakeFence(dev, &g_capturedFence12, &g_capturedFence11) || !MakeFence(dev, &g_aoFence12, &g_aoFence11)) {
         Fail("the shared fences", E_FAIL);
         return false;
@@ -423,9 +469,11 @@ bool RtaoCaptureBuffer(ID3D11Device* dev, UINT bytes, ID3D11Buffer** out11, UINT
         *madeBytes = g_captureBytes;
         return true;
     }
-    // Anything still reading the old one is done: the engine's context waited for the last AO before it captured.
-    Drop(g_capture12);
-    Drop(g_capture11);
+    // Our lists may still be reading the old one (the engine shows the last AO without waiting when the rays are
+    // behind), so it is retired, not released.
+    ReleaseDone();
+    Retire(g_capture12);
+    Retire(g_capture11);
     g_captureBytes = 0;
     D3D11_BUFFER_DESC d = {};
     d.ByteWidth = bytes;
@@ -462,8 +510,9 @@ bool SharedSoBuffer(ID3D11Device* dev, UINT bytes, ID3D11Buffer*& b11, ID3D12Res
         *madeBytes = have;
         return true;
     }
-    Drop(b12);
-    Drop(b11);
+    ReleaseDone();
+    Retire(b12);
+    Retire(b11);
     have = 0;
     D3D11_BUFFER_DESC d = {};
     d.ByteWidth = bytes;
@@ -505,8 +554,9 @@ bool RtaoUvBuffer(ID3D11Device* dev, UINT bytes, ID3D11Buffer** out11, UINT* mad
         *madeBytes = g_uvBytes;
         return true;
     }
-    Drop(g_uv12);
-    Drop(g_uv11);
+    ReleaseDone();
+    Retire(g_uv12);
+    Retire(g_uv11);
     g_uvBytes = 0;
     D3D11_BUFFER_DESC d = {};
     d.ByteWidth = bytes;
@@ -543,6 +593,8 @@ bool RtaoTrace(const RtaoFrame& f, UINT64 capturedValue, UINT64 aoValue) {
     if (!g_ready || !g_capture12 || !f.depth || !f.out || f.slot < 0 || f.slot > 1 || !f.width || !f.height
         || f.vertices < 3 || (UINT64)f.vertices * 16 > g_captureBytes)
         return false;
+    if (DeviceLost()) return false;
+    ReleaseDone();
     const UINT64 vertices = f.vertices - f.vertices % 3;
 
     // The allocator this list reuses has finished its last list (two frames back; a wait only when the card is that
@@ -631,6 +683,14 @@ bool RtaoTrace(const RtaoFrame& f, UINT64 capturedValue, UINT64 aoValue) {
     UINT64 scratchNeed = bInfo.ScratchDataSizeInBytes > tInfo.ScratchDataSizeInBytes ? bInfo.ScratchDataSizeInBytes
                                                                                     : tInfo.ScratchDataSizeInBytes;
     if (bInfo.UpdateScratchDataSizeInBytes > scratchNeed) scratchNeed = bInfo.UpdateScratchDataSizeInBytes;
+    if (f.regrow && ++g_regrowFrames % 30 == 0) {
+        // The test: every buffer the structure is made in let go (retired) and made anew, as when a frame grows.
+        Retire(g_positions);
+        Retire(g_blas);
+        Retire(g_tlas);
+        Retire(g_scratch);
+        g_positionsBytes = g_blasBytes = g_tlasBytes = g_scratchBytes = 0;
+    }
     const UINT64 blasBefore = g_blasBytes;
     if (!Grow(g_positions, g_positionsBytes, vertices * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         || !Grow(g_blas, g_blasBytes, bInfo.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
@@ -651,9 +711,9 @@ bool RtaoTrace(const RtaoFrame& f, UINT64 capturedValue, UINT64 aoValue) {
         inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         inst.AccelerationStructure = g_blas->GetGPUVirtualAddress();
         void* p = nullptr;
-        if (FAILED(g_instance->Map(0, nullptr, &p))) return false;
+        if (FAILED(g_instance[li]->Map(0, nullptr, &p))) return false;
         memcpy(p, &inst, sizeof(inst));
-        g_instance->Unmap(0, nullptr);
+        g_instance[li]->Unmap(0, nullptr);
     }
     {
         Consts c = {};
@@ -774,7 +834,7 @@ bool RtaoTrace(const RtaoFrame& f, UINT64 capturedValue, UINT64 aoValue) {
     if (stamps) l->EndQuery(g_stamps, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tb = {};
     tb.Inputs = top;
-    tb.Inputs.InstanceDescs = g_instance->GetGPUVirtualAddress();
+    tb.Inputs.InstanceDescs = g_instance[li]->GetGPUVirtualAddress();
     tb.DestAccelerationStructureData = g_tlas->GetGPUVirtualAddress();
     tb.ScratchAccelerationStructureData = g_scratch->GetGPUVirtualAddress();
     l->BuildRaytracingAccelerationStructure(&tb, 0, nullptr);
@@ -813,6 +873,7 @@ bool RtaoTrace(const RtaoFrame& f, UINT64 capturedValue, UINT64 aoValue) {
         return false;
     }
     g_allocDone[li] = aoValue;
+    g_lastSent = aoValue;
     if (refit) {
         ++g_sinceBuild;
         g_refits.fetch_add(1, std::memory_order_relaxed);

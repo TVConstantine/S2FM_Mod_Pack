@@ -113,6 +113,8 @@ struct CoreFeature {
     // A buffer opened for writing (data is where the engine writes) and closed again, before its contents go on.
     void (*mapped)(ID3D11DeviceContext* ctx, ID3D11Resource* res, void* data);
     void (*unmapping)(ID3D11DeviceContext* ctx, ID3D11Resource* res);
+    // A resource written through UpdateSubresource (box null: the whole of it), before it goes on.
+    void (*updating)(ID3D11DeviceContext* ctx, ID3D11Resource* res, const D3D11_BOX* box, const void* data);
 };
 // Up to 16, kept for the process's life (the struct must stay alive).
 void CoreRegister(const CoreFeature* feature);

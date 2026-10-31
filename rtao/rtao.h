@@ -78,6 +78,7 @@ struct RtaoFrame {
     uint64_t drawList;      // the frame's draws (rtao_capture.cpp): the same list lets the structure be refitted
     bool debug;
     bool noRefit;           // "norefit": the bottom structure made afresh every frame
+    bool regrow;            // "regrow" (a test): the structure's buffers made anew every 30th frame, as a frame that grows
     ID3D12Resource* depth;  // R32_FLOAT, the view's depth
     ID3D12Resource* out;    // R16G16B16A16_FLOAT, the AO in r
     int slot;               // which of the two depth and AO pairs (their views are kept per slot)
@@ -116,6 +117,9 @@ void RtaoCaptureLeaveCutouts(bool leave);
 void RtaoCaptureSolidCutouts(bool solid);
 // "flatnormals": no smooth normals captured; the AO is turned by the faces, as before.
 void RtaoCaptureFlatNormals(bool flat);
+// "regrow" (a test): the capture buffers made anew, a megabyte bigger, every 30th frame, as when a frame runs out of
+// room while the rays are behind.
+void RtaoCaptureRegrow(bool regrow);
 // After an AO reader of the view is drawn: it again, with stream output, into the capture.
 void RtaoCaptureDraw(ID3D11DeviceContext* ctx, struct ContextState* st);
 // Before the frame's first AO reader: a depth only draw of another view (the shadows'), into the capture of the frame

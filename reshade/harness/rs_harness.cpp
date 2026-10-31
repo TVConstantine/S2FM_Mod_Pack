@@ -652,6 +652,85 @@ static int TestImage(int argc, char** argv) {
     return 0;
 }
 
+// A room with depth, for effects that trace the depth buffer (iMMERSE RTGI): floor, ceiling, three walls, a lit panel
+// on the left wall and a window on the back one, 960x540, run for a number of frames with the frame count going up.
+// Prints how much the picture changes from one column to the next against one row to the next (a picture of
+// vertical stripes changes far more across than down) and writes the last frame.
+// rs_harness rtgi <preset> <out.ppm> [frames]
+static int TestRtgi(int argc, char** argv) {
+    if (argc < 4) { printf("FAIL: rs_harness rtgi <preset> <out.ppm> [frames]\n"); return 1; }
+    const int frames = argc > 4 ? atoi(argv[4]) : 60;
+    const unsigned w = 960, h = 540;
+    if (!Init(argv[2], kDepthDefinitions, w, h, 240000)) { PrintErrors(); return 1; }
+    std::vector<float> in((size_t)w * h * 4), out(in.size()), z((size_t)w * h);
+    const float tanHalf = 0.7f, aspect = (float)w / h;
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            const float u = (x + 0.5f) / w, v = (y + 0.5f) / h;
+            const float d[3] = { (2.0f * u - 1.0f) * tanHalf * aspect, (1.0f - 2.0f * v) * tanHalf, 1.0f };
+            // Planes: x = -250 / +250, y = -100 / +150, z = 400; the nearest hit in front.
+            float t = 1e9f;
+            int hit = -1;
+            auto plane = [&](int axis, float at, int id) {
+                if (std::fabs(d[axis]) < 1e-6f) return;
+                const float s = at / d[axis];
+                if (s > 0.0f && s < t) { t = s; hit = id; }
+            };
+            plane(0, -250.0f, 0); plane(0, 250.0f, 1); plane(1, -100.0f, 2); plane(1, 150.0f, 3); plane(2, 400.0f, 4);
+            const float p[3] = { d[0] * t, d[1] * t, d[2] * t };
+            float c[3] = { 0.35f, 0.35f, 0.35f };
+            if (hit == 2) { c[0] = 0.45f; c[1] = 0.25f; c[2] = 0.18f; }                       // floor
+            if (hit == 1) { c[0] = 0.2f; c[1] = 0.35f; c[2] = 0.5f; }                         // right wall
+            if (hit == 0 && p[2] > 120.0f && p[2] < 260.0f && p[1] > -40.0f && p[1] < 90.0f) {  // lit panel
+                c[0] = 1.0f; c[1] = 0.85f; c[2] = 0.6f;
+            }
+            if (hit == 4 && std::fabs(p[0]) < 80.0f && p[1] > 0.0f && p[1] < 110.0f) c[0] = c[1] = c[2] = 1.0f;  // window
+            float* o = &in[((size_t)y * w + x) * 4];
+            o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = 1.0f;
+            z[(size_t)y * w + x] = p[2];
+        }
+    auto depth = Fn<RsCore_HarnessDepth_Fn>("RsCore_HarnessDepth");
+    auto up = Fn<RsCore_HarnessUpload_Fn>("RsCore_HarnessUpload");
+    auto run = Fn<RsCore_HarnessRun_Fn>("RsCore_HarnessRun");
+    auto down = Fn<RsCore_HarnessDownload_Fn>("RsCore_HarnessDownload");
+    if (!depth || !up || !run || !down) return 1;
+    if (!depth(z.data(), w, h, 12.0, 2000000.0)) { printf("FAIL: depth not handed over\n"); return 1; }
+    bool ok = true;
+    for (int f = 1; f <= frames && ok; ++f)
+        ok = up(in.data(), w, h) && run(f / 60.0, (unsigned long long)f, (unsigned)f, "") && down(out.data(), w, h);
+    PrintErrors();
+    Shutdown();
+    if (!ok) { printf("FAIL: the run\n"); return 1; }
+    auto stripes = [&](const std::vector<float>& img) {
+        double across = 0.0, down = 0.0;
+        for (unsigned y = 1; y < h; ++y)
+            for (unsigned x = 1; x < w; ++x)
+                for (int k = 0; k < 3; ++k) {
+                    const float c = img[((size_t)y * w + x) * 4 + k];
+                    across += std::fabs(c - img[((size_t)y * w + x - 1) * 4 + k]);
+                    down += std::fabs(c - img[((size_t)(y - 1) * w + x) * 4 + k]);
+                }
+        return std::make_pair(across, down);
+    };
+    const auto a = stripes(in), b = stripes(out);
+    double change = 0.0;
+    for (size_t i = 0; i < in.size(); ++i) change += std::fabs(out[i] - in[i]);
+    printf("rtgi: %d frames; mean change %.4f; column to column %.0f (picture in %.0f), row to row %.0f (in %.0f), "
+           "ratio %.2f (in %.2f)\n", frames, change / in.size(), b.first, a.first, b.second, a.second,
+           b.first / (b.second + 1e-9), a.first / (a.second + 1e-9));
+    FILE* fo = nullptr;
+    if (fopen_s(&fo, argv[3], "wb") != 0 || !fo) { printf("FAIL: %s not written\n", argv[3]); return 1; }
+    fprintf(fo, "P6\n%u %u\n255\n", w, h);
+    for (size_t i = 0; i < (size_t)w * h; ++i)
+        for (int k = 0; k < 3; ++k) {
+            const float v = out[i * 4 + k] < 0.0f ? 0.0f : out[i * 4 + k] > 1.0f ? 1.0f : out[i * 4 + k];
+            fputc((int)(v * 255.0f + 0.5f), fo);
+        }
+    fclose(fo);
+    printf("image: %s written\n", argv[3]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     WCHAR self[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -677,6 +756,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(t, "assign")) r = TestAssign();
     else if (!strcmp(t, "api_uniform")) r = TestApiUniform();
     else if (!strcmp(t, "image")) r = TestImage(argc, argv);
+    else if (!strcmp(t, "rtgi")) r = TestRtgi(argc, argv);
     else printf("FAIL: unknown test %s\n", t);
     printf("%s %s\n", r == 0 ? "PASS" : r == 3 ? "SKIP" : "FAIL", t);
     return r == 3 ? 0 : r;

@@ -49,7 +49,11 @@ void Log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     if (!g_log && !g_logTried) {
         g_logTried = true;
-        // Shared for reading: the live tests read it from inside the game while it is written.
+        // The last session's log is kept beside it: after a crash or a reset of the card, the game is usually started
+        // again before anyone reads it. Shared for reading: the live tests read it from inside the game while it is
+        // written.
+        MoveFileExW(CorePath(L"s2fm_mods.log").c_str(), CorePath(L"s2fm_mods.previous.log").c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
         g_log = _wfsopen(CorePath(L"s2fm_mods.log").c_str(), L"w", _SH_DENYWR);
     }
     if (!g_log) return;

@@ -52,6 +52,7 @@ struct Reader {
 
 // --- The archives.
 struct Entry {
+    std::wstring loosePath;     // a loose file in game\core\shaders\vfx (read whole), else an archive entry
     std::wstring dirPath;
     uint16_t arch = 0;
     uint32_t off = 0, length = 0;
@@ -116,6 +117,7 @@ bool VpkEntries(const std::wstring& path, std::vector<std::string>& order, std::
 }
 
 bool VpkRead(const Entry& e, std::vector<uint8_t>& out) {
+    if (!e.loosePath.empty()) return ReadFileAll(e.loosePath, out);
     std::wstring path = e.dirPath;
     uint64_t at = e.off;
     if (e.arch == 0x7FFF) {
@@ -699,6 +701,23 @@ bool BuildShaderTable(const std::wstring& gameDir, const std::wstring& outPath, 
             if (report) *report = rep;
             return false;
         }
+    }
+    // Loose shader files (game\core\shaders\vfx), which the engine takes before the archives: shaders made outside
+    // Valve's archives (a shader compiler's own) are named too.
+    WIN32_FIND_DATAW fd;
+    const std::wstring looseDir = gameDir + L"\\core\\shaders\\vfx\\";
+    HANDLE h = FindFirstFileW((looseDir + L"*.vcs").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const std::string full = Narrow(fd.cFileName);
+            if (!entries.count(full)) order.push_back(full);
+            Entry e;
+            e.loosePath = looseDir + fd.cFileName;
+            entries[full] = std::move(e);
+            ++rep.looseFiles;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
     }
     // shader -> program -> file name; a later version of the same program (pc_41 after pc_50, say) takes its place,
     // in the archives' own order, as in the Python.

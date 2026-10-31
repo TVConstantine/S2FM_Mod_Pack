@@ -1,5 +1,5 @@
 // S2FM's open document, read from inside the process: the playhead, the session's movie name, the frame rate, the
-// SSAO settings of the camera at the playhead, and a redraw. Only the 6 May 2022 sfm.dll is read: the offsets below are that build's,
+// SSAO settings and fog controls of the camera at the playhead, and a redraw. Only the 6 May 2022 sfm.dll is read: the offsets below are that build's,
 // and the build is checked by its timestamp before anything is read. Every read is inside one __try.
 #include "sfm_doc.h"
 
@@ -165,7 +165,9 @@ void* FindSession(Doc& d)
 // Why the camera's settings were not read, for the log.
 const char* g_ssaoWhy = "";
 
-bool CameraSsao(Doc& d, float* radius, float* bias, float* strength, char* name, int nameSize)
+// The shot at the playhead (the first when the playhead is in none), or null with g_ssaoWhy saying why; ShotCamera,
+// the camera it looks through.
+void* ShotAt(Doc& d)
 {
     g_ssaoWhy = "";
     void* session = g_ssaoSession ? d.getElement(d.dm, g_ssaoSession) : nullptr;
@@ -173,9 +175,9 @@ bool CameraSsao(Doc& d, float* radius, float* bias, float* strength, char* name,
         session = FindSession(d);
         g_ssaoSession = session ? At<uint32_t>(session, kElemHandle) : 0;
     }
-    if (!session) { g_ssaoWhy = "no session is open"; return false; }
+    if (!session) { g_ssaoWhy = "no session is open"; return nullptr; }
     void* movie = ElementOf(d, session, "activeClip");
-    if (!movie) { g_ssaoWhy = "the session has no movie"; return false; }
+    if (!movie) { g_ssaoWhy = "the session has no movie"; return nullptr; }
     // The playhead, in ticks of a ten thousandth of a second, when the movie document is where it was
     // mapped; without it the first shot.
     int head = 0;
@@ -206,9 +208,23 @@ bool CameraSsao(Doc& d, float* radius, float* bias, float* strength, char* name,
         }
     }
     if (!shot) shot = first;
-    if (!shot) { g_ssaoWhy = "the movie has no shot"; return false; }
+    if (!shot) g_ssaoWhy = "the movie has no shot";
+    return shot;
+}
+
+void* ShotCamera(Doc& d)
+{
+    void* shot = ShotAt(d);
+    if (!shot) return nullptr;
     void* camera = ElementOf(d, shot, "camera");
-    if (!camera) { g_ssaoWhy = "the shot has no camera"; return false; }
+    if (!camera) g_ssaoWhy = "the shot has no camera";
+    return camera;
+}
+
+bool CameraSsao(Doc& d, float* radius, float* bias, float* strength, char* name, int nameSize)
+{
+    void* camera = ShotCamera(d);
+    if (!camera) return false;
     if (!FloatOf(camera, "SSAORadius", radius) || !FloatOf(camera, "SSAOBias", bias)
         || !FloatOf(camera, "SSAOStrength", strength)) {
         g_ssaoWhy = "the shot's camera has no SSAORadius, SSAOBias or SSAOStrength";
@@ -225,6 +241,60 @@ bool CameraSsaoGuarded(Doc& d, float* radius, float* bias, float* strength, char
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_ssaoSession = 0;
         g_ssaoWhy = "reading the document faulted";
+        return false;
+    }
+}
+
+// --- The camera's fog controls (sfm.dll's "Add Fog Controls To Camera", fn 0x2054A0: fogenable, fogstart 2500,
+// fogend 5000, fogmaxdensity 1, fogexponent 2, and fogcolor at 0x205B00). The datamodel's attribute types after
+// float (3): bool 4, colour 8 (four bytes), vector3 10, vector4 11; the enable is taken from a bool, an int or a float,
+// the colour from a colour or a vector, whichever the camera has.
+const int kAtInt = 2, kAtBool = 4, kAtColor = 8, kAtVector3 = 10, kAtVector4 = 11;
+const char* g_fogWhy = "";
+
+bool CameraFog(Doc& d, SfmFog* fog, char* name, int nameSize)
+{
+    void* camera = ShotCamera(d);
+    if (!camera) { g_fogWhy = g_ssaoWhy; return false; }
+    const void* en = FindAttr(camera, "fogenable");
+    const void* col = FindAttr(camera, "fogcolor");
+    if (!en || !col) { g_fogWhy = "the shot's camera has no fog controls (Add Fog Controls was not run on it)"; return false; }
+    const void* data = At<const void*>(en, kAttrData);
+    if (!data) { g_fogWhy = "the camera's fogenable has no value"; return false; }
+    switch (AttrType(en)) {
+    case kAtBool: fog->enabled = At<uint8_t>(data, 0) != 0; break;
+    case kAtInt: fog->enabled = At<int>(data, 0) != 0; break;
+    case kAtFloat: fog->enabled = At<float>(data, 0) > 0.5f; break;
+    default: g_fogWhy = "the camera's fogenable is of a type not read"; return false;
+    }
+    data = At<const void*>(col, kAttrData);
+    if (!data) { g_fogWhy = "the camera's fogcolor has no value"; return false; }
+    switch (AttrType(col)) {
+    case kAtColor:
+        for (int c = 0; c < 3; ++c) fog->color[c] = At<uint8_t>(data, c) / 255.0f;
+        break;
+    case kAtVector3: case kAtVector4:
+        for (int c = 0; c < 3; ++c) fog->color[c] = At<float>(data, 4 * c);
+        break;
+    default: g_fogWhy = "the camera's fogcolor is of a type not read"; return false;
+    }
+    if (!FloatOf(camera, "fogstart", &fog->start) || !FloatOf(camera, "fogend", &fog->end)
+        || !FloatOf(camera, "fogmaxdensity", &fog->maxDensity) || !FloatOf(camera, "fogexponent", &fog->exponent)) {
+        g_fogWhy = "the camera's fogstart, fogend, fogmaxdensity or fogexponent is missing";
+        return false;
+    }
+    strncpy_s(name, nameSize, NameOf(camera), _TRUNCATE);
+    g_fogWhy = "";
+    return true;
+}
+
+bool CameraFogGuarded(Doc& d, SfmFog* fog, char* name, int nameSize)
+{
+    __try {
+        return CameraFog(d, fog, name, nameSize);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_ssaoSession = 0;
+        g_fogWhy = "reading the document faulted";
         return false;
     }
 }
@@ -259,6 +329,196 @@ bool Playhead(Doc& d, double* seconds, double* fps, char* name, int nameSize)
     void* movie = ElementOf(d, session, "activeClip");
     if (name && nameSize > 0) strncpy_s(name, nameSize, movie ? NameOf(movie) : NameOf(session), _TRUNCATE);
     return true;
+}
+
+// --- The lights' fog weights (SfmLightFogs): the shot's animation sets, each light's transform and settings.
+bool BoolOf(const void* e, const char* name, bool* out)
+{
+    const void* a = FindAttr(e, name);
+    if (!a || AttrType(a) != kAtBool) return false;
+    const void* data = At<const void*>(a, kAttrData);
+    if (!data) return false;
+    *out = At<uint8_t>(data, 0) != 0;
+    return true;
+}
+
+// CMovieDoc's CUtlMaps from an element's handle to what S2FM made for it in the engine: the nodes at [doc + nodesAt],
+// nodeSize bytes each (left, right as u16 at +0, +2; the handle at +8; the object at +0x10), the root's index at
+// doc + rootAt, 0xFFFF none. S2FM's per-frame updates walk them so: models (+0x840, 0x1D7BE0), point, spot and
+// orthographic lights (+0x910, 0x1D6790), projected lights (+0x938, 0x1D6920).
+void* NodeObject(const void* doc, size_t nodesAt, size_t rootAt, size_t nodeSize, uint32_t handle)
+{
+    const uint8_t* nodes = At<const uint8_t*>(doc, nodesAt);
+    const uint16_t root = At<uint16_t>(doc, rootAt);
+    if (!nodes || root == 0xFFFF) return nullptr;
+    uint16_t stack[64];
+    int depth = 0, visited = 0;
+    stack[depth++] = root;
+    while (depth > 0 && visited++ < 4096) {
+        const uint8_t* node = nodes + (size_t)stack[--depth] * nodeSize;
+        if (At<uint32_t>(node, 8) == handle) return At<void*>(node, 0x10);
+        const uint16_t left = At<uint16_t>(node, 0), right = At<uint16_t>(node, 2);
+        if (left != 0xFFFF && depth < 64) stack[depth++] = left;
+        if (right != 0xFFFF && depth < 64) stack[depth++] = right;
+    }
+    return nullptr;
+}
+
+// A point, spot or orthographic light's world position as S2FM hands it to the engine: what it keeps for the light
+// holds it at +0x14C (measured: the document's position for every light that hangs under nothing, and the place a
+// light under a moving group really is, which the document does not hold).
+// Its forward follows at +0x158 (a unit vector).
+const size_t kLightNodes = 0x918, kLightRoot = 0x928, kLightNode = 24, kLightWorldPosition = 0x14C,
+             kLightForward = 0x158;
+
+int LightFogs(Doc& d, SfmLightFog* out, int max)
+{
+    void* shot = ShotAt(d);
+    if (!shot) return -1;
+    const void* sets = FindAttr(shot, "animationSets");
+    if (!sets) return -1;
+    void* doc = *(void**)(d.base + kMovieDocPtr);
+    if (doc && *(void**)doc != d.base + kMovieDocVtable) doc = nullptr;
+    int n = 0;
+    for (int i = 0; i < ArrayCount(sets) && n < max; ++i) {
+        void* set = ArrayElement(d, sets, i);
+        void* light = set ? ElementOf(d, set, "light") : nullptr;
+        if (!light) continue;
+        bool visible = true;
+        if (BoolOf(light, "visible", &visible) && !visible) continue;
+        // A projected light by its volumetric switch and intensity, any other by its fog setting.
+        SfmLightFog& o = out[n];
+        bool volumetric = false;
+        float strength = 1.0f;
+        o.projected = BoolOf(light, "volumetric", &volumetric);
+        o.fromEngine = false;
+        o.ortho = !strcmp(TypeOf(light), "DmeGameOrthoLight");
+        o.engine = nullptr;
+        o.forward[0] = o.forward[1] = 0.0f;
+        o.forward[2] = -1.0f;
+        o.radius = 0.0f;
+        FloatOf(light, "radius", &o.radius);
+        if (o.projected) {
+            float intensity = 1.0f;
+            FloatOf(light, "volumetricIntensity", &intensity);
+            o.weight = volumetric ? intensity : 0.0f;
+        } else if (FloatOf(light, "fogContributionStrength", &strength)) {
+            o.weight = strength;
+        } else {
+            continue;
+        }
+        void* transform = ElementOf(d, light, "transform");
+        const void* pos = transform ? FindAttr(transform, "position") : nullptr;
+        const void* data = pos && AttrType(pos) == kAtVector3 ? At<const void*>(pos, kAttrData) : nullptr;
+        if (!data) continue;
+        for (int c = 0; c < 3; ++c) o.position[c] = At<float>(data, 4 * c);
+        if (!o.projected && doc) {
+            if (const uint8_t* e = (const uint8_t*)NodeObject(doc, kLightNodes, kLightRoot, kLightNode,
+                                                              At<uint32_t>(light, kElemHandle))) {
+                for (int c = 0; c < 3; ++c) o.position[c] = At<float>(e, kLightWorldPosition + 4 * c);
+                for (int c = 0; c < 3; ++c) o.forward[c] = At<float>(e, kLightForward + 4 * c);
+                o.fromEngine = true;
+                o.engine = e;
+            }
+        }
+        ++n;
+        strncpy_s(o.name, sizeof(o.name), NameOf(light), _TRUNCATE);
+    }
+    return n;
+}
+
+int LightFogsGuarded(Doc& d, SfmLightFog* out, int max)
+{
+    __try {
+        return LightFogs(d, out, max);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_ssaoSession = 0;
+        return -1;
+    }
+}
+
+// --- The weather volumes' depth sort bias (SfmWeatherSortBias). CMovieDoc +0x840 is S2FM's CUtlMap<DmeGameModel
+// handle, CSceneObject*> (NodeObject), the nodes at [+0x848], 24 bytes each, the root's index at +0x858. A scene
+// object's reference data (+0x18) holds its world bounds (mins +0, maxes +0x10) and the object again (+0x28); its extra
+// data (+0x70) holds m_flDepthSortBias at +0x460 (engine schema). Every model's scene object was seen with its extra
+// data already made, so only the float is written here.
+const size_t kModelNodes = 0x848, kModelRoot = 0x858, kModelNode = 24;
+const size_t kObjRef = 0x18, kRefObject = 0x28, kObjExtra = 0x70, kExtraSortBias = 0x460;
+const int kAtStringArray = 32 + kAtString;
+
+void* ModelObject(const void* doc, uint32_t model)
+{
+    return NodeObject(doc, kModelNodes, kModelRoot, kModelNode, model);
+}
+
+// Whether the model's material override hands it a weather material: one of its materials or its replacement.
+bool HasWeather(Doc& d, const void* model, bool (*isWeather)(const char*))
+{
+    const void* o = ElementOf(d, model, "materialOverride");
+    if (!o) return false;
+    if (const void* a = FindAttr(o, "materials")) {
+        if (AttrType(a) == kAtStringArray) {
+            const void* v = At<const void*>(a, kAttrData);
+            const char* const* items = v ? At<const char* const*>(v, 8) : nullptr;
+            for (int i = 0; items && i < ArrayCount(a); ++i)
+                if (items[i] && isWeather(items[i])) return true;
+        }
+    }
+    const char* r = StringOf(o, "replacementMaterial");
+    return r[0] && isWeather(r);
+}
+
+int WeatherSortBias(Doc& d, bool (*isWeather)(const char*), float bias, SfmSortedModel* out, int max)
+{
+    void* shot = ShotAt(d);
+    void* doc = *(void**)(d.base + kMovieDocPtr);
+    if (!shot || !doc || *(void**)doc != d.base + kMovieDocVtable) return -1;
+    const void* sets = FindAttr(shot, "animationSets");
+    if (!sets) return -1;
+    int n = 0;
+    for (int i = 0; i < ArrayCount(sets) && n < max; ++i) {
+        void* set = ArrayElement(d, sets, i);
+        void* model = set ? ElementOf(d, set, "gameModel") : nullptr;
+        if (!model) continue;
+        const bool weather = HasWeather(d, model, isWeather);
+        void* object = ModelObject(doc, At<uint32_t>(model, kElemHandle));
+        const uint8_t* ref = object ? At<const uint8_t*>(object, kObjRef) : nullptr;
+        uint8_t* extra = object ? At<uint8_t*>(object, kObjExtra) : nullptr;
+        // The object as S2FM's map has it and as the scene system does, or it is left alone.
+        if (!ref || At<void*>(ref, kRefObject) != object || !extra) {
+            if (weather) {
+                SfmSortedModel& o = out[n++];
+                strncpy_s(o.name, sizeof(o.name), NameOf(model), _TRUNCATE);
+                o.bias = 0.0f;
+                o.written = false;
+                o.noObject = true;
+            }
+            continue;
+        }
+        float* at = (float*)(extra + kExtraSortBias);
+        const float was = *at;
+        // A model no longer a weather volume gives back the bias it had from here; any other bias is not ours.
+        const float want = weather ? bias : (was == bias ? 0.0f : was);
+        if (want != was) *at = want;
+        if (weather || want != was) {
+            SfmSortedModel& o = out[n++];
+            strncpy_s(o.name, sizeof(o.name), NameOf(model), _TRUNCATE);
+            o.bias = want;
+            o.written = want != was;
+            o.noObject = false;
+        }
+    }
+    return n;
+}
+
+int WeatherSortBiasGuarded(Doc& d, bool (*isWeather)(const char*), float bias, SfmSortedModel* out, int max)
+{
+    __try {
+        return WeatherSortBias(d, isWeather, bias, out, max);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_ssaoSession = 0;
+        return -1;
+    }
 }
 
 bool PlayheadGuarded(Doc& d, double* seconds, double* fps, char* name, int nameSize)
@@ -339,3 +599,60 @@ bool SfmCameraSsao(float* radius, float* bias, float* strength, char* cameraName
     return ok;
 }
 
+// The fog controls of the camera the shot at the playhead looks through. False when there is no session, shot or
+// camera, the camera has no fog controls, or a read faulted.
+bool SfmCameraFog(SfmFog* fog, char* cameraName, int nameSize)
+{
+    static char said[200] = "";
+    char why[200];
+    Doc d;
+    bool ok = OpenDoc(d, why, sizeof(why));
+    if (ok) {
+        ok = CameraFogGuarded(d, fog, cameraName, nameSize);
+        strcpy_s(why, g_fogWhy);
+    }
+    if (ok) {
+        if (said[0]) Log("[DOC] the camera's fog controls are read again");
+        said[0] = 0;
+    } else if (strcmp(why, said) != 0) {
+        strcpy_s(said, why);
+        Log("[DOC] the camera's fog controls are not read (no fog of ours): %s", why);
+    }
+    return ok;
+}
+
+// The lights of the shot at the playhead with their fog weights. -1 when nothing could be read.
+int SfmLightFogs(SfmLightFog* out, int max)
+{
+    char why[160];
+    Doc d;
+    if (!OpenDoc(d, why, sizeof(why))) return -1;
+    return LightFogsGuarded(d, out, max);
+}
+
+// The models of the shot at the playhead whose material override gives them a weather material: each one's scene
+// object gets the bias (and a model that stopped being one gets 0 back for it). The count of models reported, -1 when
+// nothing could be read.
+int SfmWeatherSortBias(bool (*isWeather)(const char* material), float bias, SfmSortedModel* out, int max)
+{
+    char why[160];
+    Doc d;
+    if (!OpenDoc(d, why, sizeof(why))) return -1;
+    return WeatherSortBiasGuarded(d, isWeather, bias, out, max);
+}
+
+bool SfmLightNow(const void* engine, float position[3], float forward[3])
+{
+    if (!engine) return false;
+    float v[6];
+    __try {
+        memcpy(v, (const uint8_t*)engine + kLightWorldPosition, sizeof(v));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    for (int c = 0; c < 3; ++c) {
+        position[c] = v[c];
+        forward[c] = v[3 + c];
+    }
+    return true;
+}

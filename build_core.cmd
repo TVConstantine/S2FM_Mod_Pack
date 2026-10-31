@@ -12,12 +12,13 @@ dxc.exe -nologo -T cs_6_5 -E AoMain -D AO_KERNEL=1 -Vn kRtaoAo -Fh obj\core\rtao
 cl /nologo /c /O2 /Fo"obj\core\\" minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde64.c || exit /b 1
 set SOURCES=core\core_hooks.cpp core\core_crash.cpp core\core_views.cpp core\core_table.cpp core\core_log.cpp core\core_dev.cpp ^
     common\shader_table.cpp common\shader_table_build.cpp common\lzma_decode.cpp common\sfm_doc.cpp ^
-    reshade\stages.cpp refraction\refract.cpp refraction\refract_blur.cpp ^
-    rtao\rtao_engine.cpp rtao\rtao_capture.cpp rtao\rtao_d3d12.cpp package\features.cpp
+    reshade\stages.cpp refraction\refract.cpp refraction\refract_blur.cpp refraction\scene_depth.cpp refraction\water_fx.cpp ^
+    refraction\water_carry.cpp refraction\weather_sort.cpp refraction\no_wipe.cpp sky\sky_bake.cpp ^
+    rtao\rtao_engine.cpp rtao\rtao_capture.cpp rtao\rtao_d3d12.cpp fog\fog.cpp assets\asset_deps.cpp package\features.cpp
 cl /nologo /c /O2 /Zi /EHsc /std:c++17 /W3 /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /Iobj\core /Fd"obj\core\core.pdb" /Fo"obj\core\\" %SOURCES% || exit /b 1
 set OBJS=
 for %%s in (%SOURCES%) do call set OBJS=%%OBJS%% obj\core\%%~ns.obj
 link /nologo /dll /DEBUG /OPT:REF /OPT:ICF /DEF:core\dxgi.def /OUT:bin\core\dxgi.dll /PDB:bin\core\dxgi.pdb ^
     obj\core\buffer.obj obj\core\hook.obj obj\core\trampoline.obj obj\core\hde64.obj %OBJS% ^
-    user32.lib kernel32.lib d3dcompiler.lib d3d12.lib dxguid.lib || exit /b 1
+    user32.lib kernel32.lib shell32.lib d3dcompiler.lib d3d12.lib dxguid.lib || exit /b 1
 echo built bin\core\dxgi.dll

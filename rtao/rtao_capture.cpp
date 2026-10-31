@@ -228,6 +228,7 @@ UINT g_uvBytes = 0;
 ID3D11Buffer* g_normBuf = nullptr;  // the smooth normals, 12 bytes a vertex, at the same vertex as its position
 UINT g_normBytes = 0;
 bool g_flatNormals = false;         // "flatnormals": no smooth normals, the AO turned by the faces as before
+bool g_regrow = false;              // "regrow": a megabyte more asked for every 30th frame
 UINT g_vertices = 0;
 uint64_t g_drawList = 0;   // FNV-1a over each taken draw's shaders and counts
 // Asked for when a frame ran out of room: the next frame's buffer is made at least this big.
@@ -388,6 +389,11 @@ void RtaoCaptureFlatNormals(bool flat) {
     g_flatNormals = flat;
 }
 
+void RtaoCaptureRegrow(bool regrow) {
+    std::lock_guard<std::mutex> lk(g_m);
+    g_regrow = regrow;
+}
+
 void RtaoCaptureLeaveOthers(bool leave) {
     std::lock_guard<std::mutex> lk(g_m);
     g_leaveOthers = leave;
@@ -403,6 +409,7 @@ void Reset() {
     g_views.assign(1, RtaoCaptureView{});
     g_runs.clear();
     ++g_frame;
+    if (g_regrow && g_frame % 30 == 0 && g_want < (512u << 20)) g_want += 1u << 20;
     if (g_overflowed) {
         g_overflowed = false;
         g_overflow.fetch_add(1, std::memory_order_relaxed);

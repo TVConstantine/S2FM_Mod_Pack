@@ -99,7 +99,7 @@ void SaveSettings() {
     }
 }
 float g_radiusAsked = 0.0f, g_strengthAsked = -1.0f, g_biasAsked = -1.0f;
-bool g_t9Depth = false, g_noFogFix = false, g_fogOnly = false, g_debug = false, g_noRefit = false;
+bool g_t9Depth = false, g_noFogFix = false, g_fogOnly = false, g_debug = false, g_noRefit = false, g_regrow = false;
 bool g_measure = false, g_dumpWanted = false, g_dumpDone = false, g_pictureDumped = false;
 ULONGLONG g_dumpAfter = 0;
 
@@ -1375,6 +1375,7 @@ void Fire(ID3D11DeviceContext* ctx) {
             f.runCount = (UINT)runs.size();
             f.debug = g_debug;
             f.noRefit = g_noRefit;
+            f.regrow = g_regrow;
             f.depth = g_slots[k].depth12;
             f.out = g_slots[k].ao12;
             f.slot = k;
@@ -1857,6 +1858,7 @@ void ReadSwitch(ULONGLONG now) {
     g_fogOnly = line.find("fogonly") != std::string::npos;
     g_debug = line.find("debug") != std::string::npos;
     g_noRefit = line.find("norefit") != std::string::npos;
+    g_regrow = line.find("regrow") != std::string::npos;
     g_solidBlended = line.find("solidblended") != std::string::npos;
     g_withSky = line.find("withsky") != std::string::npos;
     g_glowAll = line.find("glowall") != std::string::npos;
@@ -1869,6 +1871,7 @@ void ReadSwitch(ULONGLONG now) {
     RtaoCaptureLeaveCutouts(line.find("nocutouts") != std::string::npos);
     RtaoCaptureSolidCutouts(line.find("solidcutouts") != std::string::npos);
     RtaoCaptureFlatNormals(line.find("flatnormals") != std::string::npos);
+    RtaoCaptureRegrow(g_regrow);
     RtaoCaptureLeaveOthers(line.find("offscreen") == std::string::npos);
     if (line.find("views") != std::string::npos) {
         std::lock_guard<std::mutex> lk(g_censusM);
