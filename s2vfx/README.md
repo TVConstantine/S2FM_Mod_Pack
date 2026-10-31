@@ -3,7 +3,7 @@
 A shader compiler for the Half-Life: Alyx Workshop Tools (the 6 May 2022 build). It turns `.vfx` shader source into
 the `.vcs` files the engine loads. Valve did not ship their shader compiler; this one is written from scratch.
 
-Status: test version. The shaders here are made for Source 2 Filmmaker (S2FM).
+Released with the S2FM Mod Pack 1.1.0. The shaders here are made for Source 2 Filmmaker (S2FM).
 
 
 ## What you need
@@ -17,7 +17,7 @@ Status: test version. The shaders here are made for Source 2 Filmmaker (S2FM).
 
 ## Building (optional)
 
-A built `s2vfxc.exe` comes in `bin\` of the test package. To build it yourself:
+A built `s2vfxc.exe` comes in `compilerin\` of the release package (`S2FM_Mod_Pack_1.1.0.zip`). To build it yourself:
 
     cmake -S . -B build
     cmake --build build --config Release
@@ -59,8 +59,8 @@ Compiling takes from a few seconds (unlit) to a few minutes (weather).
 | `weather.vfx` | `s2vfx_weather` | clouds, rain, snow, sleet, hail, smoke, fog and nebulae | yes | `tests\weather_showcase.py` |
 | `sky.vfx` | `s2vfx_sky` | a procedural sky: atmosphere, clouds, sun, moon, stars, Milky Way, aurora; its HDRI and sky light | for the HDRI and sky light | `tests\sky_showcase.py` |
 
-The test package's Manual.html (made from `package\manual\manual.html` by `tools\make_manual.py`) describes every
-shader and its settings, how to make textures for them, and this compiler in full.
+The release package's Manual.html describes every shader and its settings, how to make textures for them, and
+this compiler in full.
 
 
 ## Example materials
@@ -107,7 +107,7 @@ weather material needs the two noise textures (`TextureShapeNoise` `materials/s2
 
 `glass`, `water`, `energy` and `weather` read the scene's depth and a copy of the frame. The engine does not give
 these to custom shaders; the S2FM Mod Pack (a `dxgi.dll` beside the game) does. Use the Mod Pack version that comes
-with this test package. Without it these four draw wrong: no refraction, and weather draws over everything.
+with the release package (1.1.0 or newer). Without it these four draw wrong: no refraction, and weather draws over everything.
 
 The Mod Pack also fixes a loop where materials of custom shaders in an addon compile again and again (with a large
 addon).

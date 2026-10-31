@@ -28,7 +28,7 @@ fog, stages B and C see it.
 
 First line of `s2fm_fog_debug.txt` beside the DLL: `off` (no fog), `keepengine` (the engine's camera fog stays on
 beside ours), `probe` (logs the settings sfm.dll hands the engine), `dump` (writes the picture after the fog to
-`s2fm_fog_picture.ppm`). Live test: `tests/live/fog_camera.py`.
+`s2fm_fog_picture.ppm`). (Its live test is kept in the development tree, not in this repository.)
 
 ## To do
 
