@@ -1,0 +1,244 @@
+// A refracting glass: clear, frosted or ice. Drawn among the see-through surfaces after the opaque ones; the scene
+// already drawn behind it is read from the frame copy (g_tFrameBufferCopyTexture, which Alyx never makes; the mod pack
+// makes it, with a mip chain, for any shader that reads it), bent by the surface's normal and IOR and blurred by its
+// roughness. Only what lies behind the glass is read: the scene's depth (g_tSceneDepth, the mod pack's too) keeps a
+// model standing in front of it out of what is seen through it. Tinted by its colour over the distance the light goes through it, and lit by the engine's own lights and
+// environment maps as lit.vfx is: reflections, highlights, Fresnel from the IOR, multiscatter GGX.
+//
+// Screen space: what is not on the screen behind the glass is not in it.
+
+HEADER
+{
+    Description = "Glass: refracting clear, frosted or ice glass under the engine's lights";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    Feature(F_RENDER_BACKFACES, 0..1, "Rendering");
+}
+
+COMMON
+{
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    #include "s2vfx/vertex.hlsl"
+
+    BoolAttribute(environmentmapped, true);
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_RENDER_BACKFACES, F_RENDER_BACKFACES, Sys(ALL));
+
+    RenderState(CullMode, S_RENDER_BACKFACES ? NONE : DEFAULT);
+    BoolAttribute(renderbackfaces, S_RENDER_BACKFACES ? true : false);
+    // Among the see-through surfaces, after the opaque ones (so the scene behind is in the copy), and kept out of the
+    // depth prepass (it would hide what is behind it from the opaque pass), as vr_glass has it.
+    BoolAttribute(translucent, true);
+    BoolAttribute(NoZPrepass, true);
+
+    #define S2VFX_NO_DYNAMIC_AO 1
+    #include "s2vfx/lighting.hlsl"
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"
+
+    // ------------------------------------------------------------------------------------------ colour
+    // The colour the glass gives what is seen straight through it at its thickness; looked through at a slant the
+    // light goes further through it and the colour deepens (Beer-Lambert).
+    float3 g_vColorTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Color,10/20"); >;
+    // How much of S2FM's model colour the glass takes (vr_glass's).
+    float g_flModelTintAmount < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Color,10/30"); >;
+    // "_mask": the stand in is white, clear glass, when no texture is given.
+    CreateInputTexture2D(TextureColor, Srgb, 8, "", "_mask", "Color,10/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tColor < Channel(RGB, Box(TextureColor), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    SamplerState g_sColor < Filter(ANISOTROPIC); MaxAniso(8); AddressU(WRAP); AddressV(WRAP); >;
+
+    // ------------------------------------------------------------------------------------------ refraction
+    // IOR: glass 1.5, ice 1.31, water 1.33, diamond 2.42. Thickness in world units: how far a solid piece bends what
+    // is behind it, and the depth of its colour. Thin Walled: a pane, which blurs and tints but does not shift.
+    // Cloudiness: how much of the light is scattered inside rather than passing through (milky glass, snow ice).
+    float g_flIor < UiType(Slider); Default(1.5); Range(1.0, 2.5); UiGroup("Refraction,30/10"); >;
+    float g_flThickness < UiType(Slider); Default(4.0); Range(0.0, 500.0); UiGroup("Refraction,30/20"); >;
+    bool g_bThinWalled < UiType(CheckBox); Default(0); UiGroup("Refraction,30/30"); >;
+    float g_flCloudiness < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Refraction,30/40"); >;
+    float g_flBlurScale < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Refraction,30/50"); >;
+    #include "s2vfx/screen.hlsl"
+
+    // ------------------------------------------------------------------------------------------ normal and roughness
+    // The roughness, remapped from 0..1 to Min..Max as lit.vfx has it; with no texture Min is the roughness. A texture
+    // of its own, not the normal map's third channel as in lit.vfx: with no normal map the engine's stand in carries
+    // 254 there, and an untextured glass would come out fully frosted. Rough glass is frosted: the scene behind it is
+    // blurred and its reflections soften.
+    float g_flNormalMapScaleFactor < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Normal,20/30"); >;
+    float g_flRoughnessRemapMin < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Roughness,23/20"); >;
+    float g_flRoughnessRemapMax < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Roughness,23/30"); >;
+    bool g_bMultiscatter < UiType(CheckBox); Default(1); UiGroup("Roughness,23/40"); >;
+    CreateInputTexture2D(TextureNormal, Linear, 8, "NormalizeNormals", "_normal", "Normal,20/10", Default3(0.5, 0.5, 1.0));
+    CreateInputTexture2D(TextureRoughness, Linear, 8, "", "_black_mask", "Roughness,23/10", Default3(0.0, 0.0, 0.0));
+    Texture2D g_tNormal < Channel(RG, HemiOctIsoRoughness_RG_B(TextureNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+    Texture2D g_tRoughness < Channel(R, Box(TextureRoughness), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ texture coordinates
+    // vr_glass's: every texture's uv scaled, moved and scrolled.
+    float2 g_vTexCoordScale < UiType(VectorText); Default2(1.0, 1.0); Range2(0.0, 0.0, 500.0, 500.0); UiGroup("Texture Coordinates,80/10"); >;
+    float2 g_vTexCoordOffset < UiType(VectorText); Default2(0.0, 0.0); Range2(-10.0, -10.0, 10.0, 10.0); UiGroup("Texture Coordinates,80/20"); >;
+    float2 g_vTexCoordScrollSpeed < UiType(VectorText); Default2(0.0, 0.0); Range2(-50.0, -50.0, 50.0, 50.0); UiGroup("Texture Coordinates,80/30"); >;
+
+    // ------------------------------------------------------------------------------------------ edge and glow
+    // As vr_glass has them: a colour the glass takes toward its outline, where the eye looks through it at a slant (as
+    // the edge of a thick pane goes green), up to Edge Opacity, gathered there by Edge Falloff; and a glow of its own,
+    // over all of it and more at the outline, not lit by anything.
+    float3 g_vEdgeColor < UiType(Color); Default3(0.0, 0.0, 0.0); UiGroup("Glass Color,35/10"); >;
+    float g_flEdgeColorMaxOpacity < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Glass Color,35/20"); >;
+    float g_flEdgeColorFalloff < UiType(Slider); Default(3.0); Range(0.0, 50.0); UiGroup("Glass Color,35/30"); >;
+    float3 g_vEmissiveColor < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Emissive,36/10"); >;
+    float g_flEmissiveStrength < UiType(Slider); Default(0.0); Range(0.0, 50.0); UiGroup("Emissive,36/20"); >;
+    float g_flEmissiveEdge < UiType(Slider); Default(0.0); Range(0.0, 50.0); UiGroup("Emissive,36/30"); >;
+    float g_flEmissiveEdgeFalloff < UiType(Slider); Default(3.0); Range(0.0, 50.0); UiGroup("Emissive,36/40"); >;
+
+    // ------------------------------------------------------------------------------------------ shadows
+    // Off by default: the engine's shadow maps are opaque, so a glass that casts one casts it black.
+    bool g_bCastShadows < UiType(CheckBox); Default(0); UiGroup("Rendering,90/10"); >;
+
+    // Where a world position (WorldPosition's, as the vertex stage projects it) lands on the screen, in viewport pixels.
+    float2 ScreenPixel(float3 worldPosition)
+    {
+        const float4 clip = mul(g_matWorldToProjectionMultiview[0], float4(worldPosition, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        const float2 ndc = clip.xy / max(clip.w, 1e-4);
+        return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * g_vViewportSize;
+    }
+
+    // Whether the scene at a pixel lies behind the glass, which is glassDistance from the camera along direction: a
+    // model in front of the glass is in the copy too (drawn before it), and is not seen through it. Without the mod
+    // pack's depth (the stand in reads as far away) everything counts as behind.
+    bool Behind(float2 pixel, float3 camera, float3 direction, float glassDistance)
+    {
+        return SceneDistance(pixel, camera, direction) > glassDistance - max(1.0, glassDistance * 0.002);
+    }
+
+    // The scene behind the glass, at a pixel of the copy, blurred over about radius pixels: the mip whose texel is that
+    // wide, read at eight points round a ring and the middle, so the mip's blocks do not show. A point of those that
+    // lands on something in front of the glass is left out; with none left, the scene right under the glass (own, the
+    // pixel being drawn: it passed the depth test, so what is there lies behind).
+    float3 SceneBehindGlass(float2 pixel, float radius, float2 own, float3 camera, float3 direction, float glassDistance)
+    {
+        float2 size;
+        float mips;
+        g_tFrameBufferCopyTexture.GetDimensions(0, size.x, size.y, mips);
+        const float2 inv = 1.0 / size;
+        const float lod = clamp(log2(max(radius * 0.5, 1.0)), 0.0, mips - 1.0);
+        float3 sum = 0.0;
+        float n = 0.0;
+        if (Behind(pixel, camera, direction, glassDistance))
+        {
+            sum = g_tFrameBufferCopyTexture.SampleLevel(g_sScreenClamp, InViewport(pixel) * inv, lod).rgb;
+            n = 1.0;
+        }
+        if (radius >= 1.0)
+        {
+            [unroll] for (int k = 0; k < 8; k++)
+            {
+                float s, c;
+                sincos(k * 0.785398, s, c);
+                const float2 at = pixel + float2(c, s) * radius * 0.6;
+                if (Behind(at, camera, direction, glassDistance))
+                {
+                    sum += g_tFrameBufferCopyTexture.SampleLevel(g_sScreenClamp, InViewport(at) * inv, lod).rgb;
+                    n += 1.0;
+                }
+            }
+        }
+        if (n > 0.0)
+            return sum / n;
+        return g_tFrameBufferCopyTexture.SampleLevel(g_sScreenClamp, InViewport(own) * inv, lod).rgb;
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+        if (!g_bCastShadows)
+            discard;
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float2 uv = TexCoordTransform(i.vTexCoord, g_vTexCoordScale, g_vTexCoordOffset, g_vTexCoordScrollSpeed);
+        const float3 tint = g_tColor.Sample(g_sColor, uv).rgb * ModelTint(g_vColorTint, i.vTint.rgb, g_flModelTintAmount, 1.0);
+        const float4 normalTexel = g_tNormal.Sample(g_sColor, uv);
+        const float roughness = lerp(g_flRoughnessRemapMin, g_flRoughnessRemapMax, g_tRoughness.Sample(g_sColor, uv).r);
+
+        PixelInput frame = i;
+    #if S_RENDER_BACKFACES
+        if (dot(i.vNormalWs.xyz, g_vCameraPositionWs - WorldPosition(i.vPositionWs)) < 0.0)
+            frame.vNormalWs.xyz = -i.vNormalWs.xyz;
+    #endif
+        const float3 n = normalize(NormalToWorld(frame, ScaleNormal(DecodeNormal(normalTexel.rg), g_flNormalMapScaleFactor)));
+        const float3 p = WorldPosition(i.vPositionWs);
+        const float3 v = normalize(p - g_vCameraPositionWs);           // from the camera
+        const float nDotV = max(dot(n, -v), 1e-3);
+
+        // The surface as lit.vfx lights it, with no diffuse of its own: a dielectric with the IOR's F0.
+        const float r0 = (g_flIor - 1.0) / (g_flIor + 1.0);
+        const float f0 = r0 * r0;
+        LightingSurface s = LitSurface(i, 0.0, n, roughness, 0.0, 1.0);
+        s.specularColor = f0;
+        if (g_bMultiscatter)
+            SpecularEnergy(s);
+        const DirectLight direct = DirectLighting(s);
+        const float3 ambient = AmbientDiffuse(s);
+        const float3 reflection = (direct.specular * s.directSpecularOcclusion + AmbientSpecular(s, ambient)) * s.specularEnergy;
+
+        // What gets through: the light not reflected (Schlick at the surface's roughness), less what the cloudiness
+        // scatters, coloured over the path through the glass.
+        const float fresnel = f0 + (max(1.0 - roughness, f0) - f0) * pow(1.0 - nDotV, 5.0);
+        const float path = g_bThinWalled ? 1.0 : 1.0 / max(nDotV, 0.2);
+        const float3 transmittance = pow(max(tint, 1e-4), path);
+
+        // The point behind: thin, straight on; solid, along the bent ray as far as the thickness. Rough glass reads it
+        // blurred over a width that grows with the roughness (a sixth of the view's height at roughness 1).
+        float3 behindPoint = p + v * g_flThickness;
+        if (!g_bThinWalled)
+            behindPoint = p + refract(v, n, 1.0 / g_flIor) * g_flThickness;
+        const float2 shift = ScreenPixel(behindPoint) - ScreenPixel(p + v * g_flThickness);
+        const float alpha = roughness * roughness;
+        const float radius = alpha * g_flBlurScale * g_vViewportSize.y / 6.0;
+        const float glassDistance = length(p - g_vCameraPositionWs);
+        const float3 behind = SceneBehindGlass(i.vPositionPs.xy + shift, radius, i.vPositionPs.xy, g_vCameraPositionWs,
+                                               normalize(behindPoint - g_vCameraPositionWs), glassDistance);
+
+        // Cloudiness: light scattered inside, lit as a rough diffuse surface of the glass's colour.
+        const float3 cloud = tint * (SurfaceAmbient(s) + direct.diffuse);
+        // What passes is the scene behind as the copy has it, its fog in it already: only the glass's own light is
+        // fogged (else what is seen through the glass is fogged twice), and the fog's light only where the glass hides.
+        // The edge colour covers what passes and the cloud toward the outline; the glow is added over all of it.
+        const float slant = 1.0 - nDotV;
+        const float edge = g_flEdgeColorMaxOpacity * pow(saturate(slant), max(g_flEdgeColorFalloff, 0.01));
+        const float3 edgeLit = SrgbGammaToLinear(g_vEdgeColor) * (SurfaceAmbient(s) + direct.diffuse);
+        const float3 glow = SrgbGammaToLinear(g_vEmissiveColor) *
+                            (g_flEmissiveStrength + g_flEmissiveEdge * pow(saturate(slant), max(g_flEmissiveEdgeFalloff, 0.01)));
+        const float3 share = transmittance * (1.0 - g_flCloudiness) * (1.0 - fresnel) * (1.0 - edge);
+        const float3 passing = behind * share;
+        const float3 own = (cloud * g_flCloudiness * (1.0 - edge) + edgeLit * edge) * (1.0 - fresnel) + reflection + glow;
+        const float3 result = ApplyFogSeeThrough(own, passing, 1.0 - dot(share, float3(0.2126, 0.7152, 0.0722)),
+                                                 i.vPositionWs, i.vPositionPs.xy);
+        return float4(result, 1.0);
+    }
+#endif
+}

@@ -1,0 +1,796 @@
+// A procedural sky: the atmosphere (Rayleigh and Mie scattering, ozone, multiple scattering approximated), the sun's
+// disk and glow (by hand or by the time of day), a layer of volumetric clouds and a high cirrus sheet, and the night
+// (stars, the Milky Way, the moon with its phase and its light, the aurora), all worked out per pixel from the view
+// direction: no sky texture. A seed picks the clouds and the stars, the same seed always the same sky. Drawn on any
+// model with its back faces (a big sphere round the scene): the vertex stage pins it to the far plane, so its size and
+// the camera's far plane do not matter, and it hides the map's own sky. Design:
+// docs/superpowers/specs/2026-10-29-sky-design.md.
+//
+// Units: the atmosphere in kilometres, a planet of 6360 km with its air up to 6460 km, the camera at Altitude above
+// the ground. The noises are the weather shader's (tests/weather_noise.py): set TextureShapeNoise and
+// TextureDetailNoise to them, or the clouds are flat.
+
+HEADER
+{
+    Description = "Sky: a procedural atmosphere, clouds, sun, moon and stars";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+}
+
+COMMON
+{
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    #include "s2vfx/vertex.hlsl"
+
+    // Every vertex on the far plane: the plane's depth from a point a long way down the view toward it.
+    PixelInput MainVs(VertexInput i)
+    {
+        PixelInput o = VertexMain(i);
+        const float3 p = o.vPositionWs + g_vHighPrecisionLightingOffsetWs.xyz;
+        const float3 dir = normalize(p - g_vCameraPositionWs);
+        const float4 far = mul(g_matWorldToProjectionMultiview[0],
+                               float4(g_vCameraPositionWs + dir * 1.0e7, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        o.vPositionPs.z = saturate(far.z / far.w) * 0.99999 * o.vPositionPs.w;
+        return o;
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+
+    // Seen from inside, both sides drawn; no shadow of its own.
+    RenderState(CullMode, NONE);
+    BoolAttribute(renderbackfaces, true);
+    BoolAttribute(DoNotCastShadows, true);
+
+    #include "s2vfx/material.hlsl"      // SrgbGammaToLinear
+    #include "s2vfx/engine_lighting.hlsl"
+
+    // ------------------------------------------------------------------------------------------ time of day
+    // Time of Day on: the sun follows its path through the day, at Time (hours, 12 noon) rising in the east, as high at
+    // noon as Noon Elevation (90: overhead, as at the equator), North the way north lies (degrees round from the
+    // world's +x toward +y); the moon follows a Moon Phase of a day behind it (0: new, with the sun; 0.5: full, rising
+    // as the sun sets). Off: the sun's and the moon's own azimuth and elevation below.
+    bool g_bTimeOfDay < UiType(CheckBox); Default(0); UiGroup("Time of Day,5/10"); >;
+    float g_flTimeOfDay < UiType(Slider); Default(15.0); Range(0.0, 24.0); UiGroup("Time of Day,5/20"); >;
+    float g_flNoonElevation < UiType(Slider); Default(60.0); Range(0.0, 90.0); UiGroup("Time of Day,5/30"); >;
+    float g_flNorth < UiType(Slider); Default(90.0); Range(0.0, 360.0); UiGroup("Time of Day,5/40"); >;
+    float g_flMoonPhase < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Time of Day,5/50"); >;
+
+    // ------------------------------------------------------------------------------------------ sun
+    // Where the sun is (without Time of Day): azimuth round from the world's +x toward +y, elevation above the horizon
+    // (below it: dusk, then night); or the map's own sun (Sun From Map, when the map has one). Intensity and Color: the
+    // light it gives the air and the clouds. Size: its disk's angular diameter, Sun Disk the disk's own brightness on
+    // top of that. Glow and Glow Size: a soft halo round it (the eye's and the lens' glare, apart from the haze's own).
+    float g_flSunAzimuth < UiType(Slider); Default(45.0); Range(0.0, 360.0); UiGroup("Sun,10/10"); >;
+    float g_flSunElevation < UiType(Slider); Default(35.0); Range(-30.0, 90.0); UiGroup("Sun,10/20"); >;
+    bool g_bSunFromMap < UiType(CheckBox); Default(0); UiGroup("Sun,10/30"); >;
+    float g_flSunIntensity < UiType(Slider); Default(20.0); Range(0.0, 200.0); UiGroup("Sun,10/40"); >;
+    float3 g_vSunColor < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Sun,10/50"); >;
+    float g_flSunSize < UiType(Slider); Default(0.53); Range(0.0, 20.0); UiGroup("Sun,10/60"); >;
+    float g_flSunDisk < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Sun,10/70"); >;
+    float g_flSunGlow < UiType(Slider); Default(0.5); Range(0.0, 20.0); UiGroup("Sun,10/80"); >;
+    float g_flSunGlowSize < UiType(Slider); Default(4.0); Range(0.5, 45.0); UiGroup("Sun,10/90"); >;
+
+    // ------------------------------------------------------------------------------------------ moon
+    // Where the moon is (without Time of Day), its angular diameter, brightness and colour; its phase follows the
+    // sun's direction (full opposite it), its light with it. Sky Light: how much that light brightens the night air
+    // and lights the clouds (a moonlit sky). Glow: a halo round it. Earthshine: the faint light on its dark part.
+    float g_flMoonAzimuth < UiType(Slider); Default(225.0); Range(0.0, 360.0); UiGroup("Moon,15/10"); >;
+    float g_flMoonElevation < UiType(Slider); Default(30.0); Range(-30.0, 90.0); UiGroup("Moon,15/20"); >;
+    float g_flMoonSize < UiType(Slider); Default(0.52); Range(0.0, 30.0); UiGroup("Moon,15/30"); >;
+    float g_flMoonBrightness < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Moon,15/40"); >;
+    float3 g_vMoonColor < UiType(Color); Default3(1.0, 0.97, 0.92); UiGroup("Moon,15/50"); >;
+    float g_flMoonSkyLight < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Moon,15/60"); >;
+    float g_flMoonGlow < UiType(Slider); Default(0.3); Range(0.0, 10.0); UiGroup("Moon,15/70"); >;
+    float g_flMoonEarthshine < UiType(Slider); Default(0.04); Range(0.0, 1.0); UiGroup("Moon,15/80"); >;
+
+    // ------------------------------------------------------------------------------------------ atmosphere
+    // Air: the Rayleigh scattering's density (1: Earth's; more: a deeper blue and a redder dusk). Haze: the aerosols'
+    // (Mie: the glow round the sun, a white horizon) and their colour. Ozone: the absorption that keeps the zenith
+    // blue at dusk. Multiple Scattering: the light that scatters more than once (it lifts the shadows of the sky).
+    // Altitude: the camera above the ground, in metres. Exposure: the whole sky times 2 to this.
+    float g_flAirDensity < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Atmosphere,20/10"); >;
+    float g_flHaze < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Atmosphere,20/20"); >;
+    float3 g_vHazeColor < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Atmosphere,20/30"); >;
+    float g_flHazeAnisotropy < UiType(Slider); Default(0.8); Range(0.0, 0.99); UiGroup("Atmosphere,20/40"); >;
+    float g_flOzone < UiType(Slider); Default(1.0); Range(0.0, 10.0); UiGroup("Atmosphere,20/50"); >;
+    float g_flMultipleScattering < UiType(Slider); Default(1.0); Range(0.0, 10.0); UiGroup("Atmosphere,20/60"); >;
+    float g_flAltitude < UiType(Slider); Default(100.0); Range(0.0, 50000.0); UiGroup("Atmosphere,20/70"); >;
+    // Ground: the planet below the horizon, in its colour. Off: the sky goes on below the horizon, the whole sphere
+    // sky (an HDRI to light by from every side).
+    bool g_bGround < UiType(CheckBox); Default(0); UiGroup("Atmosphere,20/75"); >;
+    float3 g_vGroundColor < UiType(Color); Default3(0.35, 0.33, 0.30); UiGroup("Atmosphere,20/80"); >;
+    float g_flExposure < UiType(Slider); Default(0.0); Range(-20.0, 20.0); UiGroup("Atmosphere,20/90"); >;
+
+    // ------------------------------------------------------------------------------------------ clouds
+    // A layer of volumetric clouds from Bottom to Bottom + Thickness (km). Coverage: how much of the sky; Density: how
+    // thick they are; Scale: a cloud's width (km); Detail: how much the small noise frays their edges; Ambient: the
+    // sky's own light in them; Silver Lining: their glow toward the sun (or the moon) through their edges. Variation:
+    // how much the cover changes from one stretch of sky to the next (heaps here, gaps there, each seed its own).
+    float g_flCloudCoverage < UiType(Slider); Default(0.45); Range(0.0, 1.0); UiGroup("Clouds,30/10"); >;
+    float g_flCloudDensity < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Clouds,30/20"); >;
+    float g_flCloudBottom < UiType(Slider); Default(1.5); Range(0.0, 15.0); UiGroup("Clouds,30/30"); >;
+    float g_flCloudThickness < UiType(Slider); Default(2.0); Range(0.05, 15.0); UiGroup("Clouds,30/40"); >;
+    float g_flCloudScale < UiType(Slider); Default(12.0); Range(0.5, 200.0); UiGroup("Clouds,30/50"); >;
+    float g_flCloudDetail < UiType(Slider); Default(0.4); Range(0.0, 1.0); UiGroup("Clouds,30/60"); >;
+    float g_flCloudVariation < UiType(Slider); Default(0.7); Range(0.0, 1.0); UiGroup("Clouds,30/65"); >;
+    float g_flCloudAmbient < UiType(Slider); Default(1.0); Range(0.0, 10.0); UiGroup("Clouds,30/70"); >;
+    float g_flCloudSilverLining < UiType(Slider); Default(0.6); Range(0.0, 1.0); UiGroup("Clouds,30/75"); >;
+    float3 g_vCloudColor < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Clouds,30/80"); >;
+
+    // Cirrus: a thin sheet of high ice cloud at Cirrus Height (km), streaked along the wind, in its colour.
+    float g_flCirrus < UiType(Slider); Default(0.3); Range(0.0, 5.0); UiGroup("Cirrus,32/10"); >;
+    float g_flCirrusHeight < UiType(Slider); Default(8.0); Range(1.0, 20.0); UiGroup("Cirrus,32/20"); >;
+    float3 g_vCirrusColor < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Cirrus,32/30"); >;
+
+    // Wind: its direction in the world's x and y; Speed (km a second) moves the clouds with S2FM's time, Evolution
+    // changes their shapes.
+    float2 g_vCloudWind < UiType(VectorText); Default2(1.0, 0.3); Range2(-1.0, -1.0, 1.0, 1.0); UiGroup("Wind,35/10"); >;
+    float g_flCloudWindSpeed < UiType(Slider); Default(0.01); Range(0.0, 1.0); UiGroup("Wind,35/20"); >;
+    float g_flCloudEvolution < UiType(Slider); Default(0.002); Range(0.0, 0.1); UiGroup("Wind,35/30"); >;
+
+    // ------------------------------------------------------------------------------------------ night
+    // Stars: their brightness, how many (Density), their Twinkle and their colours (0: white, 1: from orange red to
+    // blue white by their temperature). All the night fades into the day sky's light.
+    float g_flStars < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Stars,40/10"); >;
+    float g_flStarDensity < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Stars,40/20"); >;
+    float g_flTwinkle < UiType(Slider); Default(0.3); Range(0.0, 1.0); UiGroup("Stars,40/30"); >;
+    float g_flStarColors < UiType(Slider); Default(1.0); Range(0.0, 2.0); UiGroup("Stars,40/40"); >;
+
+    // The Milky Way: its brightness, where its band crosses the sky (Tilt) and where along it its core lies (Core, in
+    // degrees round the band); the core's warm colour and the arms' cooler one, the dark dust lanes down its middle
+    // and the glowing red nebulae in it.
+    float g_flMilkyWay < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Milky Way,42/10"); >;
+    float g_flMilkyWayTilt < UiType(Slider); Default(60.0); Range(0.0, 180.0); UiGroup("Milky Way,42/20"); >;
+    float g_flMilkyWayCore < UiType(Slider); Default(0.0); Range(0.0, 360.0); UiGroup("Milky Way,42/30"); >;
+    float3 g_vMilkyWayCoreColor < UiType(Color); Default3(1.0, 0.78, 0.55); UiGroup("Milky Way,42/40"); >;
+    float3 g_vMilkyWayArmColor < UiType(Color); Default3(0.72, 0.8, 1.0); UiGroup("Milky Way,42/50"); >;
+    float g_flMilkyWayDust < UiType(Slider); Default(0.8); Range(0.0, 1.0); UiGroup("Milky Way,42/60"); >;
+    float g_flNebulae < UiType(Slider); Default(0.5); Range(0.0, 5.0); UiGroup("Milky Way,42/70"); >;
+    float3 g_vNebulaColor < UiType(Color); Default3(1.0, 0.3, 0.5); UiGroup("Milky Way,42/80"); >;
+
+    // The aurora: curtains of light high in the air (from Height, km, up 200 km), Distance (km) toward Azimuth (round
+    // from the world's +x toward +y), each a fold Width (km) deep from the next, as many as Curtains; Waves: how much
+    // they wind, Speed: how fast they move with S2FM's time; Color low down, Top Color high up. 0 Aurora: none.
+    float g_flAurora < UiType(Slider); Default(0.0); Range(0.0, 50.0); UiGroup("Aurora,45/10"); >;
+    float3 g_vAuroraColor < UiType(Color); Default3(0.2, 1.0, 0.45); UiGroup("Aurora,45/20"); >;
+    float3 g_vAuroraTopColor < UiType(Color); Default3(0.85, 0.2, 0.6); UiGroup("Aurora,45/30"); >;
+    float g_flAuroraAzimuth < UiType(Slider); Default(90.0); Range(0.0, 360.0); UiGroup("Aurora,45/40"); >;
+    float g_flAuroraDistance < UiType(Slider); Default(400.0); Range(0.0, 2000.0); UiGroup("Aurora,45/50"); >;
+    float g_flAuroraWidth < UiType(Slider); Default(150.0); Range(10.0, 1000.0); UiGroup("Aurora,45/60"); >;
+    float g_flAuroraCurtains < UiType(Slider); Default(3.0); Range(1.0, 4.0); UiGroup("Aurora,45/70"); >;
+    float g_flAuroraWaves < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Aurora,45/80"); >;
+    float g_flAuroraSpeed < UiType(Slider); Default(0.05); Range(0.0, 2.0); UiGroup("Aurora,45/90"); >;
+    float g_flAuroraHeight < UiType(Slider); Default(100.0); Range(60.0, 300.0); UiGroup("Aurora,45/95"); >;
+
+    // ------------------------------------------------------------------------------------------ seed and noise
+    // Seed: which sky. Every seed is its own: its clouds from another part of the noise, and with Seed Variety (0:
+    // only that, 1: all of it) its own look round the settings above: the clouds' size, cover, height and depth, their
+    // kind (round heaps or flat rolls drawn out along the wind), the wind's way, the cirrus, the stars, the Milky
+    // Way's band and core and the aurora's folds. The settings stay the middle of what a seed does.
+    float g_flSeed < UiType(Slider); Default(0.0); Range(0.0, 1000.0); UiGroup("Seed,50/10"); >;
+    float g_flSeedVariety < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Seed,50/20"); >;
+    CreateInputTexture2D(TextureShapeNoise, Linear, 8, "", "_noise", "Noise,95/10", Default4(0.5, 0.5, 0.5, 0.5));
+    Texture2D g_tShapeNoise < Channel(RGBA, Box(TextureShapeNoise), Linear); OutputFormat(RGBA8888); SrgbRead(false); >;
+    CreateInputTexture2D(TextureDetailNoise, Linear, 8, "", "_noise", "Noise,95/20", Default3(0.5, 0.5, 0.5));
+    Texture2D g_tDetailNoise < Channel(RGB, Box(TextureDetailNoise), Linear); OutputFormat(RGBA8888); SrgbRead(false); >;
+    SamplerState g_sVolumeNoise < Filter(MIN_MAG_MIP_LINEAR); AddressU(CLAMP); AddressV(CLAMP); >;
+    #include "s2vfx/weather_noise.hlsl"
+
+    // ------------------------------------------------------------------------------------------ the atmosphere
+    static const float kPlanet = 6360.0, kTop = 6460.0;
+    static const float3 kRayleigh = float3(5.802, 13.558, 33.1) * 1e-3;     // per km, at the ground
+    static const float kMie = 3.996e-3, kMieExtinction = 4.40e-3;
+    static const float3 kOzone = float3(0.650, 1.881, 0.085) * 1e-3;
+
+    // Where a ray from o along d (unit) meets a sphere of radius r round the planet's centre: near and far t (km),
+    // far < 0 when it misses.
+    float2 Sphere(float3 o, float3 d, float r)
+    {
+        const float b = dot(o, d), c = dot(o, o) - r * r;
+        const float h = b * b - c;
+        if (h < 0.0)
+            return float2(-1.0, -1.0);
+        const float s = sqrt(h);
+        return float2(-b - s, -b + s);
+    }
+
+    float3 Scattering(float h, out float mie, out float3 extinction)
+    {
+        const float rayleigh = exp(-h / 8.0) * g_flAirDensity;
+        const float m = exp(-h / 1.2) * g_flHaze;
+        const float ozone = max(0.0, 1.0 - abs(h - 25.0) / 15.0) * g_flOzone;
+        mie = kMie * m;
+        extinction = kRayleigh * rayleigh + kMieExtinction * m + kOzone * ozone;
+        return kRayleigh * rayleigh;
+    }
+
+    // The optical depth of the air from height h (km) toward a direction at cosine mu from straight up, for one scale
+    // height H (Chapman's function as Schueler 2012 approximates it): what is between a point and the sun, in closed
+    // form. Below the horizon past the planet's shadow: very deep.
+    float Chapman(float h, float mu, float H)
+    {
+        const float r = kPlanet + h;
+        const float x = r / H;
+        const float c = sqrt(1.5707963 * x);
+        if (mu >= 0.0)
+            return H * exp(-h / H) * c / (c * mu + 1.0);
+        const float sinT = sqrt(saturate(1.0 - mu * mu));
+        const float x0 = x * sinT;
+        const float h0 = r * sinT - kPlanet;
+        if (h0 < 0.0)
+            return 1e4;
+        const float c0 = sqrt(1.5707963 * x0);
+        return H * (2.0 * c0 * exp(-h0 / H) - exp(-h / H) * c / (1.0 - c * mu));
+    }
+
+    float3 SunTransmittance(float h, float mu)
+    {
+        const float r = Chapman(h, mu, 8.0) * g_flAirDensity, m = Chapman(h, mu, 1.2) * g_flHaze;
+        const float o = Chapman(max(h - 10.0, 0.0), mu, 15.0) * 0.6 * g_flOzone;
+        return exp(-(kRayleigh * r + kMieExtinction * m + kOzone * o));
+    }
+
+    float RayleighPhase(float c)
+    {
+        return 0.0596831 * (1.0 + c * c);
+    }
+
+    float MiePhase(float c, float g)
+    {
+        const float g2 = g * g;
+        return 0.1193662 * (1.0 - g2) * (1.0 + c * c) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+    }
+
+    // The air's light toward the camera along d (unit), as far as tEnd (km): twelve steps, the sun's light at each by
+    // its transmittance, and the light scattered more than once as an isotropic share of what the step scatters
+    // (lit by the sun as seen from a little higher, so twilight keeps a glow). transmittance: what passes the whole way.
+    // seen: the direction the light is seen from (its phase), d itself but below the horizon without a ground, where
+    // the air is worked out along the horizon's mirror image of it.
+    float3 AirSeen(float3 o, float3 d, float3 seen, float tEnd, float3 sun, out float3 transmittance)
+    {
+        const float c = dot(seen, sun);
+        const float pr = RayleighPhase(c), pm = MiePhase(c, g_flHazeAnisotropy);
+        float3 light = 0.0;
+        float3 depth = 0.0;
+        const int steps = 12;
+        float tPrev = 0.0;
+        [loop] for (int k = 0; k < steps; k++)
+        {
+            // Denser near the camera, where the air is thick.
+            const float f = (k + 0.5) / steps;
+            const float t = tEnd * f * f;
+            const float dt = tEnd * ((k + 1.0) * (k + 1.0) - k * k) / (steps * steps);
+            const float3 p = o + d * t;
+            const float r = length(p);
+            const float h = r - kPlanet;
+            const float mu = dot(p / r, sun);
+            float mie;
+            float3 extinction;
+            const float3 rayleigh = Scattering(h, mie, extinction);
+            const float3 toCamera = exp(-(depth + extinction * dt * 0.5));
+            const float3 lit = SunTransmittance(h, mu);
+            const float3 scatter = rayleigh * pr + mie * pm * SrgbGammaToLinear(g_vHazeColor);
+            const float3 ms = (rayleigh + mie) * 0.0795775 * g_flMultipleScattering *
+                              SunTransmittance(h + 2.0, max(mu, -0.05)) * 0.4;
+            light += toCamera * (lit * scatter + ms) * dt;
+            depth += extinction * dt;
+        }
+        transmittance = exp(-depth);
+        return light;
+    }
+
+    float3 Air(float3 o, float3 d, float tEnd, float3 sun, out float3 transmittance)
+    {
+        return AirSeen(o, d, d, tEnd, sun, transmittance);
+    }
+
+    // ------------------------------------------------------------------------------------------ the seed's look
+    struct SkyLook
+    {
+        float3 offset;      // where in the noise
+        float scale, coverage, bottom, thickness, detail;
+        float stretch;      // 1 heaps; more: rolls drawn out along the wind
+        float2 wind;        // the wind's way, its length the speed's scale
+        float cirrus;
+        float2 cirrusWay;
+        float milkyWayTilt, milkyWayCore;
+        float auroraTurn;   // degrees off the aurora's azimuth
+        float2 mapOffset, mapTurn;  // where in the noise the weather map starts, and its turn (cosine, sine)
+    };
+    static SkyLook s_look;
+
+    float SeedRandom(float k)
+    {
+        return Hash13(float3(g_flSeed * 1.618034 + 0.5, k * 13.37 + 1.7, g_flSeed * 0.381966 + 7.3));
+    }
+
+    void MakeLook()
+    {
+        const float v = saturate(g_flSeedVariety);
+        s_look.offset = float3(SeedRandom(1.0), SeedRandom(2.0), SeedRandom(3.0));
+        s_look.scale = g_flCloudScale * exp2((SeedRandom(4.0) * 2.0 - 1.0) * 1.3 * v);
+        s_look.coverage = saturate(g_flCloudCoverage + (SeedRandom(5.0) - 0.5) * 0.5 * v);
+        s_look.bottom = g_flCloudBottom * exp2((SeedRandom(6.0) - 0.5) * 1.2 * v);
+        s_look.thickness = g_flCloudThickness * exp2((SeedRandom(7.0) - 0.5) * 1.6 * v);
+        s_look.detail = saturate(g_flCloudDetail + (SeedRandom(8.0) - 0.5) * 0.5 * v);
+        const float roll = SeedRandom(9.0);
+        s_look.stretch = lerp(1.0, 1.0 + 4.0 * roll * roll, v);
+        const float2 w = g_vCloudWind + 1e-4;
+        const float angle = atan2(w.y, w.x) + (SeedRandom(10.0) - 0.5) * 6.2831853 * v;
+        s_look.wind = float2(cos(angle), sin(angle)) * length(w);
+        s_look.cirrus = g_flCirrus * lerp(1.0, SeedRandom(11.0) * 2.5, v);
+        const float ca = angle + (SeedRandom(12.0) - 0.5) * 3.1415927 * v;
+        s_look.cirrusWay = float2(cos(ca), sin(ca));
+        s_look.milkyWayTilt = g_flMilkyWayTilt + (SeedRandom(13.0) - 0.5) * 120.0 * v;
+        s_look.milkyWayCore = g_flMilkyWayCore + (SeedRandom(14.0) - 0.5) * 180.0 * v;
+        s_look.auroraTurn = (SeedRandom(15.0) - 0.5) * 50.0 * v;
+        s_look.mapOffset = float2(SeedRandom(16.0), SeedRandom(17.0));
+        const float turn = SeedRandom(18.0) * 6.2831853;
+        s_look.mapTurn = float2(cos(turn), sin(turn));
+    }
+
+    // ------------------------------------------------------------------------------------------ the frame's noise
+    uint Pcg(uint v)
+    {
+        const uint state = v * 747796405u + 2891336453u;
+        const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        return (word >> 22u) ^ word;
+    }
+
+    // A value in [0, 1) for this pixel to start a ray march's steps at, its own for each pixel and for each of
+    // progressive refinement's samples: a hash of the pixel and of what changes from one sample to the next (all of
+    // the projection, where its jitter sits depending on how the buffer packs it; the camera's place, which the depth
+    // of field moves; the time). A viewport standing still keeps its grain, and the refinement averages it away.
+    // Every pixel on its own: one offset for the whole frame (a hash of the time alone, or one turning a spread
+    // pattern) moved every pixel's steps together from one sample to the next, and the clouds slid and came back.
+    float PixelJitter(float2 pixel)
+    {
+        const float4x4 m = g_matWorldToProjectionMultiview[0];
+        uint h = Pcg(asuint(g_flTime));
+        [unroll] for (int r = 0; r < 4; r++)
+            h = Pcg(Pcg(Pcg(Pcg(h ^ asuint(m[r].x)) ^ asuint(m[r].y)) ^ asuint(m[r].z)) ^ asuint(m[r].w));
+        h = Pcg(Pcg(Pcg(h ^ asuint(g_vCameraPositionWs.x)) ^ asuint(g_vCameraPositionWs.y)) ^ asuint(g_vCameraPositionWs.z));
+        const uint2 p = (uint2)max(pixel, 0.0);
+        h = Pcg(h ^ Pcg(p.x ^ Pcg(p.y)));
+        return (float)(h >> 8) * (1.0 / 16777216.0);
+    }
+
+    float Luminance(float3 c)
+    {
+        return dot(c, float3(0.2126, 0.7152, 0.0722));
+    }
+
+    // ------------------------------------------------------------------------------------------ clouds
+    // The cloud layer's density at p (km, from the planet's centre): the shape noise's Perlin-Worley over the
+    // coverage, rounded at the bottom and the top, frayed by the detail noise as far as near says (1 close by, 0 far:
+    // finer than a pixel there, its fraying only sparkled from one sample to the next).
+    float CloudDensity(float3 p, float3 drift, float near)
+    {
+        const float h = length(p) - kPlanet;
+        const float f = saturate((h - s_look.bottom) / s_look.thickness);
+        const float profile = saturate(f * 6.0) * saturate((1.0 - f) * 2.5);
+        if (profile <= 0.0)
+            return 0.0;
+        const float3 m = p + drift;
+        // The weather map: the shape noise read 7.3 times coarser and turned (its repeats out of step with the
+        // clouds'), raising and lowering the cover from one stretch of sky to the next. The clouds' own noise repeats
+        // every Scale km, and without it the same rows of clouds came round again and again.
+        const float2 g = m.xy / (s_look.scale * 7.3);
+        const float2 w = float2(s_look.mapTurn.x * g.x - s_look.mapTurn.y * g.y, s_look.mapTurn.y * g.x + s_look.mapTurn.x * g.y);
+        const float region = ShapeNoise(float3(w + s_look.mapOffset, 0.37)).r;
+        const float cover = saturate(s_look.coverage + (region - 0.5) * 1.2 * g_flCloudVariation);
+        if (cover <= 0.0)
+            return 0.0;
+        // In the wind's frame, drawn out along it as far as the seed's kind of cloud says.
+        const float2 way = normalize(s_look.wind);
+        const float3 q = float3(dot(m.xy, way) / s_look.stretch, dot(m.xy, float2(-way.y, way.x)), m.z) / s_look.scale;
+        const float4 shape = ShapeNoise(float3(q.xy, q.z * 2.0) + s_look.offset);
+        const float worley = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+        float base = saturate((shape.r - (1.0 - worley)) / max(worley, 1e-3));
+        base = saturate((base * profile - (1.0 - cover)) / max(cover, 1e-3));
+        if (base <= 0.0)
+            return 0.0;
+        if (near <= 0.0)
+            return base * g_flCloudDensity;
+        const float3 detail = DetailNoise(q * 6.0 + s_look.offset.zxy);
+        const float fray = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
+        return saturate(base - fray * s_look.detail * near * (1.0 - base)) * g_flCloudDensity;
+    }
+
+    // The clouds along d from o (km) between t0 and t1, lit by a light from toLight (the sun, or the moon at night) of
+    // keyLight there and by the ambient: their light and what they let through.
+    float3 Clouds(float3 o, float3 d, float t0, float t1, float3 toLight, float3 keyLight, float3 ambient, float jitter,
+                  out float through)
+    {
+        through = 1.0;
+        float3 light = 0.0;
+        // As many steps as the stretch through the layer is long: 24 straight up, up to 96 toward the horizon, where a
+        // ray crosses up to 120 km of it (a fixed 24 made 5 km steps there, through a layer 2 km deep: more noise
+        // than a refinement's samples could take away).
+        const int steps = (int)clamp(ceil((t1 - t0) / 0.35), 24.0, 96.0);
+        const float dt = (t1 - t0) / steps;
+        const float c = dot(d, toLight);
+        // Two lobes: forward (the silver lining) and back.
+        const float phase = lerp(MiePhase(c, -0.2), MiePhase(c, 0.75), saturate(g_flCloudSilverLining));
+        const float3 drift = float3(s_look.wind * g_flCloudWindSpeed * g_flTime, g_flCloudEvolution * g_flTime);
+        [loop] for (int k = 0; k < steps; k++)
+        {
+            const float t = t0 + (k + jitter) * dt;
+            const float3 p = o + d * t;
+            const float near = 1.0 - smoothstep(30.0, 80.0, t);
+            const float density = CloudDensity(p, drift, near);
+            if (density <= 0.0)
+                continue;
+            // Toward the light: three steps, wider each time.
+            float toKey = 0.0;
+            [unroll] for (int j = 1; j <= 3; j++)
+                toKey += CloudDensity(p + toLight * (0.15 * j * j), drift, near) * 0.15 * (2 * j - 1);
+            const float extinction = density * 25.0;
+            const float beer = exp(-toKey * 25.0);
+            const float powder = 1.0 - exp(-extinction * 0.2);
+            const float h = saturate((length(p) - kPlanet - s_look.bottom) / s_look.thickness);
+            const float3 lit = keyLight * beer * phase * (0.6 + 0.4 * powder) + ambient * (0.4 + 0.6 * h) * g_flCloudAmbient;
+            const float step = exp(-extinction * dt);
+            light += through * lit * (1.0 - step) * SrgbGammaToLinear(g_vCloudColor);
+            through *= step;
+            if (through < 0.01)
+                break;
+        }
+        return light;
+    }
+
+    // ------------------------------------------------------------------------------------------ sun and moon
+    float3 Direction(float azimuthDegrees, float elevationDegrees)
+    {
+        float sa, ca, se, ce;
+        sincos(radians(azimuthDegrees), sa, ca);
+        sincos(radians(elevationDegrees), se, ce);
+        return float3(ca * ce, sa * ce, se);
+    }
+
+    // The way toward a body at hour angle H (radians from its noon) on the Time of Day's path (a body on the celestial
+    // equator): rising in the east, at its noon toward the equator as high as Noon Elevation, setting in the west.
+    float3 OnPath(float H)
+    {
+        float sh, ch, sl, cl;
+        sincos(H, sh, ch);
+        sincos(radians(90.0 - g_flNoonElevation), sl, cl);
+        float sn, cn;
+        sincos(radians(g_flNorth), sn, cn);
+        const float2 north = float2(cn, sn), east = float2(sn, -cn);
+        return normalize(float3(north * (-sl * ch) + east * (-sh), cl * ch));
+    }
+
+    float3 SunDirection()
+    {
+        if (g_bSunFromMap && dot(g_vSunLightDir, g_vSunLightDir) > 0.5)
+            return -normalize(g_vSunLightDir);
+        if (g_bTimeOfDay)
+            return OnPath((g_flTimeOfDay / 24.0 - 0.5) * 6.2831853);
+        return Direction(g_flSunAzimuth, g_flSunElevation);
+    }
+
+    // With Time of Day the moon is a Moon Phase of a day behind the sun on the same path.
+    float3 MoonDirection()
+    {
+        if (g_bTimeOfDay)
+            return OnPath((g_flTimeOfDay / 24.0 - 0.5 - g_flMoonPhase) * 6.2831853);
+        return Direction(g_flMoonAzimuth, g_flMoonElevation);
+    }
+
+    // The moon's light (on the air and the clouds): its colour and brightness times the share of its face the sun
+    // lights as seen from here (its phase), times Sky Light.
+    float3 MoonLight(float3 moon, float3 sun)
+    {
+        const float lit = 0.5 * (1.0 - dot(moon, sun));
+        return SrgbGammaToLinear(g_vMoonColor) * g_flMoonBrightness * g_flMoonSkyLight * lit * 0.4;
+    }
+
+    // The sun's disk toward d (cs its cosine to the sun), darker and redder at its limb, and its glow round it.
+    float3 SunDisk(float cs)
+    {
+        const float sunRadius = radians(max(g_flSunSize, 0.01) * 0.5);
+        const float angle2 = 2.0 * max(1.0 - cs, 0.0);     // the angle squared, close to the sun
+        const float glowSize = radians(g_flSunGlowSize);
+        float3 c = g_flSunGlow * 0.02 * (exp(-angle2 / (glowSize * glowSize)) + 0.15 * exp(-angle2 / (16.0 * glowSize * glowSize)));
+        if (cs > cos(sunRadius))
+        {
+            const float r = sqrt(saturate(1.0 - cs * cs)) / sin(sunRadius);
+            const float mu = sqrt(saturate(1.0 - r * r));
+            const float3 limb = lerp(float3(0.55, 0.32, 0.18), 1.0, pow(mu, float3(0.4, 0.5, 0.7)));
+            c += limb * g_flSunDisk * 40.0;
+        }
+        return c;
+    }
+
+    // The moon's disk toward d: lit on its sun side (its phase), the rest by the faint earthshine, a little darker at
+    // its limb, with its maria; and its glow round it.
+    float3 Moon(float3 d, float3 moon, float3 sun)
+    {
+        const float radius = radians(max(g_flMoonSize, 0.01) * 0.5);
+        const float c = dot(d, moon);
+        const float3 colour = SrgbGammaToLinear(g_vMoonColor) * g_flMoonBrightness;
+        const float angle2 = 2.0 * max(1.0 - c, 0.0);
+        const float glowSize = radius * 5.0;
+        float3 glow = colour * g_flMoonGlow * 0.5 * (0.5 * (1.0 - dot(moon, sun))) *
+                      (exp(-angle2 / (glowSize * glowSize)) * 0.15 + exp(-angle2 / (16.0 * glowSize * glowSize)) * 0.02);
+        if (c < cos(radius))
+            return glow;
+        // The point of the moon's sphere this pixel sees, and its normal.
+        float3 side = normalize(cross(moon, abs(moon.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0)));
+        const float3 up = cross(side, moon);
+        const float2 q = float2(dot(d, side), dot(d, up)) / sin(radius);
+        const float z = sqrt(saturate(1.0 - dot(q, q)));
+        const float3 normal = q.x * side + q.y * up - z * moon;
+        const float lit = saturate(dot(normal, sun));
+        const float terminator = smoothstep(0.0, 0.08, lit);
+        const float4 n = ShapeNoise(float3(q * 0.5, 0.3));
+        const float4 n2 = ShapeNoise(float3(q * 1.6 + 3.1, 0.7));
+        const float maria = saturate(0.78 + 0.28 * n.r - 0.3 * saturate(n.g * 1.8 - 0.9) - 0.08 * n2.b);
+        const float shade = (terminator * 0.6 + saturate(g_flMoonEarthshine) * 0.05) * maria * (0.6 + 0.4 * z);
+        return glow + colour * shade;
+    }
+
+    // ------------------------------------------------------------------------------------------ night
+    // The stars toward d: two layers of a grid over the cube's faces, one star a cell at most, a soft dot a pixel or
+    // two across (fwidth: the pixel's own size on the sky).
+    float3 Stars(float3 d, float pixel)
+    {
+        const float3 a = abs(d);
+        const float m = max(a.x, max(a.y, a.z));
+        float2 uv;
+        float face;
+        if (m == a.x) { uv = d.yz / a.x; face = d.x > 0.0 ? 0.0 : 1.0; }
+        else if (m == a.y) { uv = d.xz / a.y; face = d.y > 0.0 ? 2.0 : 3.0; }
+        else { uv = d.xy / a.z; face = d.z > 0.0 ? 4.0 : 5.0; }
+        float3 sum = 0.0;
+        [unroll] for (int layer = 0; layer < 2; layer++)
+        {
+            const float cells = layer == 0 ? 220.0 : 600.0;
+            const float2 g = (uv * 0.5 + 0.5) * cells;
+            const float2 cell = floor(g);
+            const float3 r = Hash33(float3(cell, face * 17.0 + layer * 101.0 + s_look.offset.x * 977.0));
+            // Few bright ones on the coarse layer, more faint ones on the fine one.
+            if (r.z > g_flStarDensity * (layer == 0 ? 0.06 : 0.2))
+                continue;
+            const float2 at = cell + 0.15 + 0.7 * r.xy;
+            const float dist = length(g - at) / cells * 2.0;      // on the face, in uv units
+            const float size = max(pixel * 0.9, 1e-5);
+            // A star's light is its own, whatever the pixel: drawn over a wider pixel (a far zoomed out view, the mod
+            // pack's bake into a 512 cube) it is that much fainter, (reference / size)^2, the reference a pixel of a
+            // 90 degree view 2576 wide; at most 4 times brighter for a narrower one.
+            const float spread = min(pow(0.00055 / size, 2.0), 4.0);
+            const float bright = (pow(Hash13(float3(cell, face + layer * 7.0 + 3.1)), 6.0) * (layer == 0 ? 2.0 : 0.4) + 0.02) * spread;
+            const float twinkle = 1.0 + g_flTwinkle * sin(g_flTime * (3.0 + r.x * 6.0) + r.y * 40.0) * 0.5;
+            // Colour by temperature: from orange red to blue white, as far as Star Colors says.
+            const float tmp = Hash13(float3(cell.yx, face + 11.0));
+            const float3 hue = lerp(float3(1.0, 0.65, 0.4), float3(0.75, 0.85, 1.0), tmp);
+            const float3 tint = max(lerp(Luminance(hue), hue, g_flStarColors), 0.0);
+            sum += tint * bright * twinkle * exp(-(dist * dist) / (size * size));
+        }
+        return sum * g_flStars;
+    }
+
+    // The Milky Way: a band round a great circle (tilted from the world's x axis), wider and brighter toward its core
+    // (warm there, cooler out along the arms), mottled with star clouds, split down its middle by dark dust lanes,
+    // with red nebulae glowing in it.
+    float3 MilkyWay(float3 d)
+    {
+        float s, c;
+        sincos(radians(s_look.milkyWayTilt), s, c);
+        const float3 pole = normalize(float3(0.0, s, c));
+        const float across = dot(d, pole);
+        if (abs(across) > 0.75)
+            return 0.0;
+        // How far round the band from the core.
+        const float3 start = normalize(cross(pole, abs(pole.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0)));
+        float sk, ck;
+        sincos(radians(s_look.milkyWayCore), sk, ck);
+        const float3 core = start * ck + cross(pole, start) * sk;
+        const float3 flat = normalize(d - pole * across + 1e-5);
+        const float round = acos(clamp(dot(flat, core), -1.0, 1.0));
+        const float bulge = exp(-round * round * 1.4);
+        const float width = lerp(0.16, 0.32, bulge);
+        const float band = exp(-(across * across) / (width * width));
+        if (band < 0.005)
+            return 0.0;
+        const float4 n = ShapeNoise(d * 1.7 + s_look.offset.yzx);
+        const float4 fine = ShapeNoise(d * 6.3 + s_look.offset.zxy);
+        const float starClouds = saturate(n.r * 1.4 - 0.25) * (0.6 + 0.4 * n.g) * (0.65 + 0.7 * fine.r);
+        const float lane = exp(-(across * across) / (width * width * 0.07)) * saturate(n.b * 1.6 - 0.2 + fine.g * 0.4);
+        const float dust = 1.0 - saturate(g_flMilkyWayDust) * saturate(lane);
+        const float3 colour = lerp(SrgbGammaToLinear(g_vMilkyWayArmColor), SrgbGammaToLinear(g_vMilkyWayCoreColor), bulge);
+        float3 light = colour * band * starClouds * dust * (1.0 + 2.5 * bulge);
+        // The nebulae: soft clouds of the smooth noise (the cellular one made spots), patchy over a broader one.
+        const float4 nb = ShapeNoise(d * 2.2 + s_look.offset.yxz);
+        const float nebula = smoothstep(0.55, 0.9, nb.r * (0.7 + 0.6 * n.g)) * band * (0.4 + bulge) * (0.6 + 0.4 * fine.r);
+        light += SrgbGammaToLinear(g_vNebulaColor) * nebula * g_flNebulae * dust;
+        return light * 0.04 * g_flMilkyWay;
+    }
+
+    // The aurora along v from o (km): curtains of light from Height up 200 km, each a winding line on the ground
+    // map (Distance toward Azimuth, the next ones further on by Width), thin across and tall, in vertical rays, green
+    // low and Top Color high, brightest just above its bottom.
+    float3 Aurora(float3 o, float3 v, float jitter)
+    {
+        const float bottom = g_flAuroraHeight, depth = 200.0;
+        const float2 lo = Sphere(o, v, kPlanet + bottom), hi = Sphere(o, v, kPlanet + bottom + depth);
+        float t0 = max(lo.y, 0.0), t1 = min(max(hi.y, 0.0), 2500.0);
+        float sa, ca;
+        sincos(radians(g_flAuroraAzimuth + s_look.auroraTurn), sa, ca);
+        const float2 toward = float2(ca, sa), along = float2(-sa, ca);
+        const float curtains = clamp(g_flAuroraCurtains, 1.0, 4.0);
+        // Only where the curtains can be: the ray's distance toward them grows straight along it (o is above the map's
+        // origin), so the slab from the nearest to the furthest curtain, waves and all, is a stretch of t; the steps
+        // spread over that alone are fine enough for curtains a few tens of km thick.
+        const float toward1 = dot(v.xy, toward);
+        if (toward1 <= 1e-4)
+            return 0.0;
+        const float reach = 260.0 * g_flAuroraWaves + 60.0;
+        t0 = max(t0, (g_flAuroraDistance - reach) / toward1);
+        t1 = min(t1, (g_flAuroraDistance + (curtains - 1.0) * g_flAuroraWidth + reach) / toward1);
+        if (t1 <= t0)
+            return 0.0;
+        const float time = g_flTime * g_flAuroraSpeed;
+        const float3 seed = s_look.offset * 7.0;
+        const int steps = 32;
+        const float dt = (t1 - t0) / steps;
+        float3 sum = 0.0;
+        [loop] for (int k = 0; k < steps; k++)
+        {
+            const float3 p = o + v * (t0 + (k + jitter) * dt);
+            const float hh = saturate((length(p) - kPlanet - bottom) / depth);
+            const float rise = smoothstep(0.0, 0.04, hh) * exp(-hh * 3.5);
+            if (rise < 0.01)
+                continue;
+            const float x = dot(p.xy, toward), y = dot(p.xy, along);
+            const float rays = 0.35 + 0.65 * ShapeNoise(float3(y * 0.025, time * 3.0, 0.7) + seed).g;
+            float glow = 0.0;
+            [unroll] for (int c = 0; c < 4; c++)
+            {
+                const float weight = saturate(curtains - c);
+                if (weight <= 0.0)
+                    break;
+                const float wave = (ShapeNoise(float3(y * 0.0015 + c * 3.1, time + c * 1.7, 0.3) + seed).r - 0.5) *
+                                   240.0 * g_flAuroraWaves;
+                const float off = x - (g_flAuroraDistance + c * g_flAuroraWidth) - wave;
+                glow += exp(-off * off / 400.0) * weight;
+            }
+            const float3 colour = lerp(SrgbGammaToLinear(g_vAuroraColor), SrgbGammaToLinear(g_vAuroraTopColor),
+                                       saturate(hh * 1.6));
+            sum += colour * glow * rays * rise * dt;
+        }
+        return sum * g_flAurora * 0.003;
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float3 world = i.vPositionWs + g_vHighPrecisionLightingOffsetWs.xyz;
+        const float3 d = normalize(world - g_vCameraPositionWs);
+        const float pixel = length(fwidth(d));
+        MakeLook();
+        const float3 sun = SunDirection(), moon = MoonDirection();
+        const float3 sunColor = SrgbGammaToLinear(g_vSunColor) * g_flSunIntensity;
+        const float3 o = float3(0.0, 0.0, kPlanet + max(g_flAltitude, 1.0) * 0.001);
+        // The night comes as the sun goes down past the horizon (the day sky's light drowns it, as the eye's adaptation
+        // does); the moon's light on the air with it.
+        const float dark = 1.0 - smoothstep(-0.18, 0.0, sun.z);
+        const float3 moonLight = MoonLight(moon, sun) * smoothstep(-0.1, 0.05, moon.z);
+        const bool moonlit = dark > 0.0 && Luminance(moonLight) > 0.0;
+        const float jitter = PixelJitter(i.vPositionPs.xy);
+
+        // Below the horizon without a ground the sky goes on round the whole sphere: its air as it is as high above
+        // the horizon (the horizon its brightest band, the nadir as deep as the zenith; the sun's glow where the sun
+        // is), its clouds another stretch of the same layer (not the ones above, mirrored), the stars where they
+        // are; the sun's and the moon's disks only above it.
+        const bool below = d.z < 0.0 && !g_bGround;
+        const float3 v = below ? float3(d.xy, -d.z) : d;
+
+        // The air as far as the top of the atmosphere, or the ground, lit by the sun and by the moon.
+        const float2 top = Sphere(o, v, kTop);
+        const float2 ground = Sphere(o, v, kPlanet);
+        const bool hitsGround = ground.x > 0.0;
+        const float tEnd = hitsGround ? ground.x : max(top.y, 0.0);
+        float3 airThrough;
+        float3 color = AirSeen(o, v, d, tEnd, sun, airThrough) * sunColor;
+        if (moonlit)
+        {
+            float3 unused;
+            color += AirSeen(o, v, d, tEnd, moon, unused) * moonLight * dark;
+        }
+
+        if (hitsGround)
+        {
+            // The ground below the horizon, lit by the sun through the air and by a little sky: the sky's share goes
+            // out as the sun sets, over the same twilight the stars come in over (or the ground is lit at night by
+            // a day sky's share of a sun far below the horizon, and outshines the night sky); and by the moon.
+            const float3 g = o + d * ground.x;
+            const float3 n = normalize(g);
+            const float3 lit = SunTransmittance(0.0, dot(n, sun)) * saturate(dot(n, sun)) + 0.05 * (1.0 - dark);
+            color += airThrough * SrgbGammaToLinear(g_vGroundColor) *
+                     (lit * sunColor + moonLight * dark * (saturate(dot(n, moon)) + 0.05)) * 0.318;
+        }
+        else
+        {
+            if (!below)
+                color += airThrough * sunColor * SunDisk(dot(d, sun));
+            const float3 night = (Stars(d, pixel) + MilkyWay(d)) * dark + (below ? 0.0 : Moon(d, moon, sun) * 4.0);
+            color += night * airThrough;
+            if (g_flAurora > 0.0 && dark > 0.0)
+                color += Aurora(o, v, jitter) * dark * airThrough;
+
+            // Below the horizon, another stretch of the cloud layer and of the cirrus.
+            if (below)
+                s_look.offset += float3(17.31, 5.17, 3.73);
+            // The cloud layer: where the ray crosses it (from below: from its bottom to its top), not too far off.
+            const float2 lo = Sphere(o, v, kPlanet + s_look.bottom);
+            const float2 hi = Sphere(o, v, kPlanet + s_look.bottom + s_look.thickness);
+            const float t0 = max(lo.y, 0.0), t1 = min(max(hi.y, 0.0), 120.0);
+            if (s_look.coverage > 0.0 && g_flCloudDensity > 0.0 && t1 > t0)
+            {
+                const float3 mid = o + v * (0.5 * (t0 + t1));
+                const float h = length(mid) - kPlanet;
+                const float3 up = normalize(mid);
+                // Lit by whichever of the sun and the moon lights them more there (the sun after it has set, as long
+                // as it still reaches them), and by the sky round them.
+                const float3 sunHere = SunTransmittance(h, dot(up, sun)) * sunColor;
+                const float3 moonHere = SunTransmittance(h, dot(up, moon)) * moonLight * dark * 1.5;
+                const bool byMoon = Luminance(moonHere) > Luminance(sunHere);
+                float3 zenithThrough;
+                float3 ambient = Air(mid, float3(0, 0, 1), 8.0, sun, zenithThrough) * sunColor * 6.0;
+                if (moonlit)
+                    ambient += Air(mid, float3(0, 0, 1), 8.0, moon, zenithThrough) * moonLight * dark * 1.5;
+                float through;
+                const float3 clouds = Clouds(o, v, t0, t1, byMoon ? moon : sun, byMoon ? moonHere : sunHere, ambient,
+                                             jitter, through);
+                // Seen through the air in front of them: the far ones sit in the haze.
+                float3 frontThrough;
+                const float3 front = AirSeen(o, v, d, t0, sun, frontThrough) * sunColor;
+                color = lerp(color, front + frontThrough * clouds / max(1.0 - through, 1e-3), 1.0 - through);
+            }
+
+            // Cirrus: a thin sheet at its height, streaked along the wind, lit by the sun and the moon.
+            const float2 ci = Sphere(o, v, kPlanet + g_flCirrusHeight);
+            if (s_look.cirrus > 0.0 && ci.y > 0.0)
+            {
+                const float3 p = o + v * ci.y;
+                const float2 wind = s_look.cirrusWay;
+                const float2 along = float2(dot(p.xy, wind), dot(p.xy, float2(-wind.y, wind.x)));
+                const float2 q = float2(along.x * 0.02, along.y * 0.08) + s_look.wind * g_flCloudWindSpeed * g_flTime * 0.02;
+                const float4 n = ShapeNoise(float3(q, 0.5) + s_look.offset.zyx);
+                const float sheet = saturate((n.r * 0.7 + n.g * 0.3) * 1.6 - 0.75) * s_look.cirrus;
+                const float3 up = normalize(p);
+                const float3 light = (SunTransmittance(g_flCirrusHeight, dot(up, sun)) * sunColor *
+                                          (MiePhase(dot(d, sun), 0.6) * 0.8 + 0.08) +
+                                      SunTransmittance(g_flCirrusHeight, dot(up, moon)) * moonLight * dark * 1.5 *
+                                          (MiePhase(dot(d, moon), 0.6) * 0.8 + 0.08)) * SrgbGammaToLinear(g_vCirrusColor);
+                const float fade = saturate(v.z * 8.0);
+                color = lerp(color, light, saturate(sheet * fade * 0.6));
+            }
+        }
+        return float4(color * exp2(g_flExposure), 1.0);
+    }
+#endif
+}

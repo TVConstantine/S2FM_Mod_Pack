@@ -1,0 +1,1015 @@
+// Energy: a core of unstable energy, as Half-Life 2: Episode One's Citadel core (Source 1's Core shader) and Alyx's
+// energy fields are, written from scratch for this project. Each part is a left menu feature of the "Energy" group:
+//   Refraction  the scene behind bent by a flowing turbulence (and a lens, by the IOR), blurred, tinted;
+//   Rim         a glowing ring where the surface turns away from the eye, ragged by the turbulence, coloured by a ramp;
+//   Interior    a dark core inside the ring, seen at a depth below the surface (parallax), its liquid surface rippling
+//               out from drops falling in now and then, its crests and swirls glowing, and reflecting the environment;
+//   Shell       the outer shell outside the ring: refracting harder toward the outline, a glow along it, and bright
+//               streaks where the turbulence folds;
+//   Reflection  the engine's lights and environment maps on top, by the IOR's Fresnel;
+//   Dissolve    the surface eaten away by noise, a glowing edge where it goes;
+//   Charge      bands of energy winding out from the middle through the ring (or in from the ring), the ring flaring as
+//               each one reaches it;
+//   Blob       the surface itself heaving in lumps that keep changing, swelling and calming by turns;
+//   Heat Haze   a shimmer round the core, outside its outline: the scene behind bent and blurred, streaming outward.
+// Without any feature it is a clear surface. Where it meets the scene behind it fades into it (no hard line). Time is
+// the engine's (g_flTime), which follows S2FM's timeline: a render gives the same picture for the same frame.
+//
+// Screen space, as glass.vfx: what is not on the screen behind the surface is not in it. The frame copy and the
+// scene's depth are made by the mod pack for any shader that reads them. Blob and Heat Haze are made for a round model
+// about its origin (a sphere): their sizes are shares of the distance from it.
+
+HEADER
+{
+    Description = "Energy: a refracting, glowing core of energy with a rim, a deep interior, reflections and dissolve";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    Feature(F_RENDER_BACKFACES, 0..1, "Rendering");
+    // Each part only shows its controls in the Material Editor (UiOnly below); the code is the same for every value.
+    Feature(F_REFRACTION, 0..1, "Energy");
+    Feature(F_RIM, 0..1, "Energy");
+    Feature(F_INTERIOR, 0..1, "Energy");
+    Feature(F_SHELL, 0..1, "Energy");
+    Feature(F_REFLECTION, 0..1, "Energy");
+    Feature(F_DISSOLVE, 0..1, "Energy");
+    Feature(F_CHARGE, 0..1, "Energy");
+    Feature(F_BLOB, 0..1, "Energy");
+    Feature(F_HEAT_HAZE, 0..1, "Energy");
+}
+
+COMMON
+{
+    // Blob and Heat Haze move the surface in the vertex stage (Displace below).
+    #define S2VFX_DISPLACE 1
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    StaticCombo(S_BLOB, F_BLOB, Sys(ALL), UiOnly(g_flBlobOn));
+    StaticCombo(S_HEAT_HAZE, F_HEAT_HAZE, Sys(ALL), UiOnly(g_flHeatHazeOn));
+
+    float g_flBlobOn < Default(0.0); >;
+    float g_flHeatHazeOn < Default(0.0); >;
+
+    // ------------------------------------------------------------------------------------------ blob
+    // The surface heaves in lumps, as a core that has lost its hold: Amount how high (a share of the radius), Lumps how
+    // many round it, Speed how fast they churn, Detail finer lumps on them, Surges how much the whole swells and calms
+    // by turns (the rim flares as it swells). The model's own vertices move: a lump needs several of them across it, so
+    // more Lumps and Detail want a finer model (S2FM's dev sphere has about 24 round it).
+    float g_flBlobAmount < UiType(Slider); Default(0.05); Range(0.0, 0.5); UiGroup("Blob,65/10"); UiFeature(F_BLOB); >;
+    float g_flBlobLumps < UiType(Slider); Default(1.5); Range(0.5, 8.0); UiGroup("Blob,65/20"); UiFeature(F_BLOB); >;
+    float g_flBlobSpeed < UiType(Slider); Default(0.4); Range(0.0, 4.0); UiGroup("Blob,65/30"); UiFeature(F_BLOB); >;
+    float g_flBlobDetail < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Blob,65/40"); UiFeature(F_BLOB); >;
+    float g_flBlobSurges < UiType(Slider); Default(0.3); Range(0.0, 1.0); UiGroup("Blob,65/50"); UiFeature(F_BLOB); >;
+
+    // ------------------------------------------------------------------------------------------ heat haze
+    // Width: how far out from the core the haze reaches (a share of the radius). The rest is in the pixel stage.
+    float g_flHeatHazeWidth < UiType(Slider); Default(0.7); Range(0.0, 2.0); UiGroup("Heat Haze,70/10"); UiFeature(F_HEAT_HAZE); >;
+
+    // A cell corner's random direction (PCG hash).
+    float3 Gradient3(int3 cell)
+    {
+        uint h = (uint)cell.x * 747796405u + (uint)cell.y * 2891336453u + (uint)cell.z * 1181783497u + 277803737u;
+        h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+        h = (h >> 22u) ^ h;
+        const float z = (h & 0xffffu) * (2.0 / 65535.0) - 1.0;
+        float s, c;
+        sincos((h >> 16u) * (6.2831853 / 65536.0), s, c);
+        const float r = sqrt(saturate(1.0 - z * z));
+        return float3(r * c, r * s, z);
+    }
+
+    // Gradient noise at p (about -1..1) in x, its gradient in yzw.
+    float4 Noise3(float3 p)
+    {
+        const float3 corner = floor(p);
+        const int3 c = (int3)corner;
+        const float3 f = p - corner;
+        const float3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+        const float3 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+        const float3 g000 = Gradient3(c), g100 = Gradient3(c + int3(1, 0, 0));
+        const float3 g010 = Gradient3(c + int3(0, 1, 0)), g110 = Gradient3(c + int3(1, 1, 0));
+        const float3 g001 = Gradient3(c + int3(0, 0, 1)), g101 = Gradient3(c + int3(1, 0, 1));
+        const float3 g011 = Gradient3(c + int3(0, 1, 1)), g111 = Gradient3(c + int3(1, 1, 1));
+        const float v000 = dot(g000, f), v100 = dot(g100, f - float3(1.0, 0.0, 0.0));
+        const float v010 = dot(g010, f - float3(0.0, 1.0, 0.0)), v110 = dot(g110, f - float3(1.0, 1.0, 0.0));
+        const float v001 = dot(g001, f - float3(0.0, 0.0, 1.0)), v101 = dot(g101, f - float3(1.0, 0.0, 1.0));
+        const float v011 = dot(g011, f - float3(0.0, 1.0, 1.0)), v111 = dot(g111, f - 1.0);
+        // The corners blended, written out: v000 + k1 u.x + k2 u.y + k3 u.z + k4 u.x u.y + k5 u.y u.z + k6 u.z u.x +
+        // k7 u.x u.y u.z.
+        const float k1 = v100 - v000, k2 = v010 - v000, k3 = v001 - v000;
+        const float k4 = v000 - v100 - v010 + v110, k5 = v000 - v010 - v001 + v011, k6 = v000 - v100 - v001 + v101;
+        const float k7 = -v000 + v100 + v010 - v110 + v001 - v101 - v011 + v111;
+        const float value = v000 + k1 * u.x + k2 * u.y + k3 * u.z + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x +
+                            k7 * u.x * u.y * u.z;
+        // Its gradient: the corners' directions blended the same way, and the blend's own slope.
+        const float3 g = g000 + u.x * (g100 - g000) + u.y * (g010 - g000) + u.z * (g001 - g000) +
+                         u.x * u.y * (g000 - g100 - g010 + g110) + u.y * u.z * (g000 - g010 - g001 + g011) +
+                         u.z * u.x * (g000 - g100 - g001 + g101) +
+                         u.x * u.y * u.z * (-g000 + g100 + g010 - g110 + g001 - g101 - g011 + g111) +
+                         du * float3(k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+                                     k2 + k4 * u.x + k5 * u.z + k7 * u.z * u.x,
+                                     k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+        return float4(value, g);
+    }
+
+    // The lumps, then the haze's shell. extra: x the core's share of the shell's radius (1: no haze), y the haze's
+    // width in world units, z how far the blob is swelling now (0..1).
+    void Displace(inout float3 position, inout float3 normal, float3x4 m, out float4 extra)
+    {
+        extra = float4(1.0, 0.0, 0.0, 0.0);
+        const float radius = length(position);
+        if (radius < 1e-4)
+            return;
+        const float3 meshNormal = normal;
+        if (g_flBlobOn > 0.5 && g_flBlobAmount > 0.0)
+        {
+            const float t = g_flTime * g_flBlobSpeed;
+            const float3 q = position / radius * g_flBlobLumps;
+            // Two sets of lumps drifting different ways: where they meet they swell, where they part they sink, so
+            // the shape keeps changing instead of turning round.
+            const float4 a = Noise3(q + float3(0.31, 0.7, 0.4) * t);
+            const float4 b = Noise3(q * 2.1 + float3(-0.6, 0.35, 0.8) * t + 7.3);
+            const float4 lumps = (a + float4(b.x, b.yzw * 2.1) * g_flBlobDetail) / (1.0 + g_flBlobDetail);
+            // Surges: the whole swells and calms by turns, a slow noise in time.
+            const float swell = saturate(Noise3(float3(t * 0.23, 5.1, 2.9)).x * 1.2 + 0.5);
+            const float height = g_flBlobAmount * lerp(1.0, 0.3 + 1.2 * swell, g_flBlobSurges);
+            position += normal * (radius * height * lumps.x);
+            // The normal tilts down the lumps' slope: their gradient over the surface (the radius cancels out).
+            const float3 slope = lumps.yzw * (height * g_flBlobLumps);
+            normal = normalize(normal - (slope - normal * dot(normal, slope)));
+            extra.z = swell * g_flBlobSurges;
+        }
+        if (g_flHeatHazeOn > 0.5 && g_flHeatHazeWidth > 0.0)
+        {
+            // Out along the mesh's own normal: along the lumps' tilted one the shell would fold into fins.
+            const float core = length(position);
+            const float3 push = meshNormal * (radius * g_flHeatHazeWidth);
+            position += push;
+            extra.x = core / max(length(position), 1e-4);
+            extra.y = length(mul((float3x3)m, push));
+        }
+    }
+
+    #include "s2vfx/vertex.hlsl"
+
+    BoolAttribute(environmentmapped, true);
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_RENDER_BACKFACES, F_RENDER_BACKFACES, Sys(ALL));
+    StaticCombo(S_REFRACTION, F_REFRACTION, Sys(ALL), UiOnly(g_flRefractionOn));
+    StaticCombo(S_RIM, F_RIM, Sys(ALL), UiOnly(g_flRimOn));
+    StaticCombo(S_INTERIOR, F_INTERIOR, Sys(ALL), UiOnly(g_flInteriorOn));
+    StaticCombo(S_SHELL, F_SHELL, Sys(ALL), UiOnly(g_flShellOn));
+    StaticCombo(S_REFLECTION, F_REFLECTION, Sys(ALL), UiOnly(g_flReflectionOn));
+    StaticCombo(S_DISSOLVE, F_DISSOLVE, Sys(ALL), UiOnly(g_flDissolveOn));
+    StaticCombo(S_CHARGE, F_CHARGE, Sys(ALL), UiOnly(g_flChargeOn));
+    StaticCombo(S_HEAT_HAZE, F_HEAT_HAZE, Sys(ALL), UiOnly(g_flHeatHazeOn));
+
+    RenderState(CullMode, S_RENDER_BACKFACES ? NONE : DEFAULT);
+    BoolAttribute(renderbackfaces, S_RENDER_BACKFACES ? true : false);
+    // Among the see-through surfaces, after the opaque ones (so the scene behind is in the copy), and kept out of the
+    // depth prepass, as glass.vfx.
+    BoolAttribute(translucent, true);
+    BoolAttribute(NoZPrepass, true);
+
+    #define S2VFX_NO_DYNAMIC_AO 1
+    #include "s2vfx/lighting.hlsl"
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"
+
+    float g_flRefractionOn < Default(0.0); >;
+    float g_flRimOn < Default(0.0); >;
+    float g_flInteriorOn < Default(0.0); >;
+    float g_flShellOn < Default(0.0); >;
+    float g_flReflectionOn < Default(0.0); >;
+    float g_flDissolveOn < Default(0.0); >;
+    float g_flChargeOn < Default(0.0); >;
+    float g_flHeatHazeOn < Default(0.0); >;
+
+    SamplerState g_sWrap < Filter(ANISOTROPIC); MaxAniso(8); AddressU(WRAP); AddressV(WRAP); >;
+    SamplerState g_sClampLinear < Filter(MIN_MAG_MIP_LINEAR); AddressU(CLAMP); AddressV(CLAMP); >;
+    Texture2D g_tFrameBufferCopyTexture;
+    Texture2D g_tSceneDepth;
+    // The uv's change across a pixel, taken at the start of MainPs: the textures are read with it, as a read after
+    // the haze's early return could not work it out.
+    static float2 s_vUvDdx, s_vUvDdy;
+
+    // ------------------------------------------------------------------------------------------ flow
+    // The turbulence every part takes its motion from: noise across the texture (Scale cells over uv 0..1, whole
+    // numbers so it wraps round a sphere's seam), carried along the flow (Flow Direction in uv a second, plus the flow
+    // map's: red and green, grey for none) at Flow Speed, in two phases half a cycle apart so it never jumps back.
+    float g_flTurbulenceScale < UiType(Slider); Default(6.0); Range(1.0, 64.0); UiGroup("Flow,10/10"); >;
+    float g_flTurbulenceDetail < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Flow,10/20"); >;
+    float2 g_vFlowDirection < UiType(VectorText); Default2(0.02, 0.05); Range2(-1.0, -1.0, 1.0, 1.0); UiGroup("Flow,10/30"); >;
+    float g_flFlowSpeed < UiType(Slider); Default(1.0); Range(0.0, 10.0); UiGroup("Flow,10/40"); >;
+    float g_flFlowCycle < UiType(Slider); Default(2.0); Range(0.25, 10.0); UiGroup("Flow,10/50"); >;
+    CreateInputTexture2D(TextureFlow, Linear, 8, "", "_flow", "Flow,10/60", Default3(0.5, 0.5, 0.0));
+    Texture2D g_tFlow < Channel(RG, Box(TextureFlow), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    // A normal map of one's own (as Source 1's Core takes its look from its normal map), carried by the flow the same
+    // way, Tiling times across the texture, as strong as Normal Strength (0: not used). Cells: a bumpy surface of
+    // rounded cells (a honeycomb-like ice), Cell Scale of them across the texture, without any texture.
+    CreateInputTexture2D(TextureNormal, Linear, 8, "NormalizeNormals", "_normal", "Flow,10/70", Default3(0.5, 0.5, 1.0));
+    Texture2D g_tNormal < Channel(RG, Box(TextureNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+    float g_flNormalStrength < UiType(Slider); Default(0.0); Range(0.0, 20.0); UiGroup("Flow,10/80"); >;
+    float g_flNormalTiling < UiType(Slider); Default(2.0); Range(1.0, 32.0); UiGroup("Flow,10/90"); >;
+    float g_flCells < UiType(Slider); Default(0.0); Range(0.0, 4.0); UiGroup("Flow,10/100"); >;
+    float g_flCellScale < UiType(Slider); Default(24.0); Range(2.0, 128.0); UiGroup("Flow,10/110"); >;
+
+    // ------------------------------------------------------------------------------------------ refraction
+    // Strength: how far the turbulence bends the scene behind. IOR and Thickness: a lens as glass.vfx has it (1, or
+    // 0 units, for none). Blur in pixels of a 1080 line picture; Chromatic spreads red and blue apart; Tint colours it.
+    float g_flRefractStrength < UiType(Slider); Default(1.0); Range(0.0, 40.0); UiGroup("Refraction,20/10"); UiFeature(F_REFRACTION); >;
+    float g_flRefractIor < UiType(Slider); Default(1.2); Range(1.0, 2.5); UiGroup("Refraction,20/20"); UiFeature(F_REFRACTION); >;
+    float g_flRefractThickness < UiType(Slider); Default(10.0); Range(0.0, 200.0); UiGroup("Refraction,20/30"); UiFeature(F_REFRACTION); >;
+    float g_flRefractBlur < UiType(Slider); Default(2.0); Range(0.0, 40.0); UiGroup("Refraction,20/40"); UiFeature(F_REFRACTION); >;
+    float g_flRefractChromatic < UiType(Slider); Default(0.3); Range(0.0, 1.0); UiGroup("Refraction,20/50"); UiFeature(F_REFRACTION); >;
+    float3 g_vRefractTint < UiType(Color); Default3(0.85, 0.95, 1.0); UiGroup("Refraction,20/60"); UiFeature(F_REFRACTION); >;
+
+    // ------------------------------------------------------------------------------------------ rim
+    // A ring of light where the surface turns away from the eye: Position from 0 (the middle facing the eye) to 1 (the
+    // outline), Width, Softness of its edges, Noise how ragged the turbulence makes it. The ramp runs across the ring
+    // (left: its inner edge, right: its outer), times the colour and the brightness (HDR: above 1 blooms).
+    float3 g_vRimColor < UiType(Color); Default3(1.0, 0.55, 0.12); UiGroup("Rim,30/10"); UiFeature(F_RIM); >;
+    float g_flRimBrightness < UiType(Slider); Default(8.0); Range(0.0, 100.0); UiGroup("Rim,30/20"); UiFeature(F_RIM); >;
+    float g_flRimPosition < UiType(Slider); Default(0.55); Range(0.0, 1.0); UiGroup("Rim,30/30"); UiFeature(F_RIM); >;
+    float g_flRimWidth < UiType(Slider); Default(0.12); Range(0.0, 1.0); UiGroup("Rim,30/40"); UiFeature(F_RIM); >;
+    float g_flRimSoftness < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Rim,30/50"); UiFeature(F_RIM); >;
+    float g_flRimNoise < UiType(Slider); Default(0.4); Range(0.0, 1.0); UiGroup("Rim,30/60"); UiFeature(F_RIM); >;
+    // Streaks: fine lines of a swirled field that comb the colours along the swirls (Streak Lines: how many across).
+    // Opacity: how far the ramp's colour covers what is seen through (0: only added light; 1: the ramp is the
+    // surface, its black a black core). With Position 0.5 and Width 1 the ramp runs from the middle to the outline,
+    // as Source 1's Core colours its whole sphere.
+    float g_flRimStreaks < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Rim,30/62"); UiFeature(F_RIM); >;
+    float g_flRimStreakLines < UiType(Slider); Default(10.0); Range(1.0, 60.0); UiGroup("Rim,30/64"); UiFeature(F_RIM); >;
+    float g_flRimOpacity < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Rim,30/66"); UiFeature(F_RIM); >;
+    // Pulse: the core beats. At each beat its colours swell out from the middle and draw back, the ring widens a
+    // little and it flares; Pulse how much, Pulse Rate beats a minute, Heartbeat a double beat (a heart's) instead of a
+    // slow breath.
+    float g_flRimPulse < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Rim,30/80"); UiFeature(F_RIM); >;
+    float g_flRimPulseRate < UiType(Slider); Default(40.0); Range(1.0, 200.0); UiGroup("Rim,30/82"); UiFeature(F_RIM); >;
+    bool g_bRimHeartbeat < UiType(CheckBox); Default(1); UiGroup("Rim,30/84"); UiFeature(F_RIM); >;
+    // Breathe: the ring and the dark middle it holds never keep still: they swell and shrink, the ring thickens and
+    // thins, and its shape round the disc changes (Breathe how much, Breathe Speed how fast).
+    float g_flRimBreathe < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Rim,30/86"); UiFeature(F_RIM); >;
+    float g_flRimBreatheSpeed < UiType(Slider); Default(0.5); Range(0.0, 4.0); UiGroup("Rim,30/88"); UiFeature(F_RIM); >;
+    // Radial Flow: tongues of colour streaming out from the middle and others drawn in from the outline through
+    // them, as an unstable core (seen from the eye: out and in across the disc); Radial Speed how fast, Radial Detail
+    // how many tongues round it.
+    float g_flRimRadialFlow < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Rim,30/90"); UiFeature(F_RIM); >;
+    float g_flRimRadialSpeed < UiType(Slider); Default(0.25); Range(0.0, 2.0); UiGroup("Rim,30/92"); UiFeature(F_RIM); >;
+    // Color Cycle: over this many seconds the rim's colours turn to the Cycle Color and back (0: still). They turn by
+    // hue the shorter way round, keeping their brightness: orange to turquoise goes by yellow and green, never through
+    // dark. Cycle Blend how far they turn (0: not at all). A ramp with rows of its own also runs down them, its top
+    // row to its bottom and back, over the same time.
+    float g_flRimColorCycle < UiType(Slider); Default(0.0); Range(0.0, 30.0); UiGroup("Rim,30/96"); UiFeature(F_RIM); >;
+    float3 g_vRimCycleColor < UiType(Color); Default3(0.1, 0.85, 0.75); UiGroup("Rim,30/97"); UiFeature(F_RIM); >;
+    float g_flRimCycleBlend < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Rim,30/98"); UiFeature(F_RIM); >;
+    float g_flRimRadialDetail < UiType(Slider); Default(14.0); Range(2.0, 64.0); UiGroup("Rim,30/94"); UiFeature(F_RIM); >;
+    CreateInputTexture2D(TextureRimRamp, Srgb, 8, "", "_mask", "Rim,30/70", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tRimRamp < Channel(RGB, Box(TextureRimRamp), Srgb); OutputFormat(DXT1); SrgbRead(true); UiFeature(F_RIM); >;
+
+    // ------------------------------------------------------------------------------------------ interior
+    // Inside the ring a core seen Depth below the surface (in uv: 0.1 is a tenth of the texture), its liquid surface
+    // rippling out from drops falling in now and then (Ripples, Ripple Scale, Ripple Speed) and swirling, reflecting the environment
+    // (Reflectivity) in its Color; Opacity how much of what is behind it shows through.
+    float3 g_vInteriorColor < UiType(Color); Default3(0.02, 0.03, 0.04); UiGroup("Interior,40/10"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorOpacity < UiType(Slider); Default(0.95); Range(0.0, 1.0); UiGroup("Interior,40/20"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorDepth < UiType(Slider); Default(0.08); Range(0.0, 0.5); UiGroup("Interior,40/30"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorRipples < UiType(Slider); Default(1.0); Range(0.0, 2.0); UiGroup("Interior,40/40"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorRippleScale < UiType(Slider); Default(18.0); Range(2.0, 200.0); UiGroup("Interior,40/50"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorRippleSpeed < UiType(Slider); Default(0.3); Range(0.0, 4.0); UiGroup("Interior,40/60"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorSwirl < UiType(Slider); Default(0.5); Range(0.0, 2.0); UiGroup("Interior,40/70"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorReflectivity < UiType(Slider); Default(1.5); Range(0.0, 8.0); UiGroup("Interior,40/80"); UiFeature(F_INTERIOR); >;
+    float3 g_vInteriorReflectionTint < UiType(Color); Default3(0.6, 0.9, 1.0); UiGroup("Interior,40/90"); UiFeature(F_INTERIOR); >;
+    // Its own light, whatever the surroundings: the ripples' crests glow as thin rings (Sharpness: thinner) and the
+    // turbulence's folds as swirling lines (Swirl Lines), in the Glow colour (HDR: above 1 blooms).
+    float3 g_vInteriorGlowColor < UiType(Color); Default3(0.35, 0.8, 1.0); UiGroup("Interior,40/100"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorGlow < UiType(Slider); Default(0.5); Range(0.0, 250.0); UiGroup("Interior,40/110"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorGlowSharpness < UiType(Slider); Default(20.0); Range(1.0, 64.0); UiGroup("Interior,40/120"); UiFeature(F_INTERIOR); >;
+    // Marble: glowing contour lines of a swirled field, as liquid swirled about (Marble Lines: how many across).
+    float g_flInteriorMarble < UiType(Slider); Default(0.6); Range(0.0, 8.0); UiGroup("Interior,40/140"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorMarbleLines < UiType(Slider); Default(6.0); Range(1.0, 40.0); UiGroup("Interior,40/150"); UiFeature(F_INTERIOR); >;
+    float g_flInteriorSwirlLines < UiType(Slider); Default(0.25); Range(0.0, 4.0); UiGroup("Interior,40/130"); UiFeature(F_INTERIOR); >;
+
+    // ------------------------------------------------------------------------------------------ shell
+    // The shell outside the ring (all of it without the Rim), a thin film of energy: Edge Refraction bends the scene
+    // behind more toward the outline (times Refraction's strength); a Glow along the outline (Glow Width: 1 a thin
+    // line, 8 a wide haze); Streaks, fine lines where the turbulence folds, crackling on and off in patches (Crackle:
+    // how much of the time they are out, 0 always lit). Rim Tint: how far its colours take the ring's (and its cycle).
+    float g_flShellEdgeRefraction < UiType(Slider); Default(3.0); Range(0.0, 16.0); UiGroup("Shell,45/10"); UiFeature(F_SHELL); >;
+    float3 g_vShellGlowColor < UiType(Color); Default3(0.55, 0.85, 1.0); UiGroup("Shell,45/20"); UiFeature(F_SHELL); >;
+    float g_flShellGlow < UiType(Slider); Default(1.5); Range(0.0, 250.0); UiGroup("Shell,45/30"); UiFeature(F_SHELL); >;
+    float g_flShellGlowWidth < UiType(Slider); Default(3.0); Range(1.0, 16.0); UiGroup("Shell,45/40"); UiFeature(F_SHELL); >;
+    float3 g_vShellStreakColor < UiType(Color); Default3(0.8, 0.95, 1.0); UiGroup("Shell,45/50"); UiFeature(F_SHELL); >;
+    float g_flShellStreaks < UiType(Slider); Default(1.5); Range(0.0, 20.0); UiGroup("Shell,45/60"); UiFeature(F_SHELL); >;
+    float g_flShellStreakSharpness < UiType(Slider); Default(24.0); Range(1.0, 64.0); UiGroup("Shell,45/70"); UiFeature(F_SHELL); >;
+    float g_flShellCrackle < UiType(Slider); Default(0.6); Range(0.0, 1.0); UiGroup("Shell,45/75"); UiFeature(F_SHELL); >;
+    // The shell's own colour over what is seen through it, a film thickest toward the outline (Opacity at it).
+    float3 g_vShellColor < UiType(Color); Default3(0.55, 0.8, 0.95); UiGroup("Shell,45/80"); UiFeature(F_SHELL); >;
+    float g_flShellOpacity < UiType(Slider); Default(0.2); Range(0.0, 1.0); UiGroup("Shell,45/90"); UiFeature(F_SHELL); >;
+    float g_flShellBrightness < UiType(Slider); Default(0.6); Range(0.0, 100.0); UiGroup("Shell,45/100"); UiFeature(F_SHELL); >;
+    float g_flShellRimTint < UiType(Slider); Default(0.6); Range(0.0, 1.0); UiGroup("Shell,45/110"); UiFeature(F_SHELL); >;
+
+    // ------------------------------------------------------------------------------------------ reflection
+    // The engine's lights and environment maps on the turbulent surface, as Source 1's Core: Tint, Contrast (0 as it
+    // is, 1 squared) and Saturation (0 grey, 1 as it is); Roughness, and the IOR for its Fresnel.
+    float3 g_vReflectionTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Reflection,50/10"); UiFeature(F_REFLECTION); >;
+    float g_flReflectionStrength < UiType(Slider); Default(1.0); Range(0.0, 40.0); UiGroup("Reflection,50/20"); UiFeature(F_REFLECTION); >;
+    float g_flReflectionContrast < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Reflection,50/30"); UiFeature(F_REFLECTION); >;
+    float g_flReflectionSaturation < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Reflection,50/40"); UiFeature(F_REFLECTION); >;
+    float g_flReflectionRoughness < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Reflection,50/50"); UiFeature(F_REFLECTION); >;
+    float g_flReflectionIor < UiType(Slider); Default(1.5); Range(1.0, 2.5); UiGroup("Reflection,50/60"); UiFeature(F_REFLECTION); >;
+
+    // ------------------------------------------------------------------------------------------ dissolve
+    // Amount 0 whole, 1 gone; the noise's Scale; a glowing Edge of that Width and colour (HDR) where it is eaten away.
+    float g_flDissolve < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Dissolve,60/10"); UiFeature(F_DISSOLVE); >;
+    float g_flDissolveScale < UiType(Slider); Default(8.0); Range(1.0, 64.0); UiGroup("Dissolve,60/20"); UiFeature(F_DISSOLVE); >;
+    float g_flDissolveEdgeWidth < UiType(Slider); Default(0.05); Range(0.0, 0.5); UiGroup("Dissolve,60/30"); UiFeature(F_DISSOLVE); >;
+    float3 g_vDissolveEdgeColor < UiType(Color); Default3(1.0, 0.5, 0.1); UiGroup("Dissolve,60/40"); UiFeature(F_DISSOLVE); >;
+    float g_flDissolveEdgeBrightness < UiType(Slider); Default(10.0); Range(0.0, 100.0); UiGroup("Dissolve,60/50"); UiFeature(F_DISSOLVE); >;
+
+    // ------------------------------------------------------------------------------------------ charge
+    // The ring travels and its fire streams, as a core charging up. Over Cycle seconds the ring sets out from Start
+    // (0 the middle, 1 the outline, on the screen) and grows to its Position, brightening as it goes, and fades there
+    // as the next one sets out: a loop, never coming back; with Inward the rings go the other way, from the Position
+    // down to Start (Cycle 0: the ring stays).
+    // Flow: how fast its fire streams the same way, out or in; Spiral how far the streams wind round as they go (below
+    // 0 the other way). The dark middle grows and shrinks with the ring and its texture streams the same way (Inside
+    // Sync), or it keeps its own size and streams on its own: Inside Inward, Inside Flow.
+    float g_flChargeCycle < UiType(Slider); Default(5.0); Range(0.0, 30.0); UiGroup("Charge,62/10"); UiFeature(F_CHARGE); >;
+    float g_flChargeStart < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Charge,62/20"); UiFeature(F_CHARGE); >;
+    bool g_bChargeInward < UiType(CheckBox); Default(0); UiGroup("Charge,62/30"); UiFeature(F_CHARGE); >;
+    float g_flChargeFlow < UiType(Slider); Default(0.6); Range(0.0, 4.0); UiGroup("Charge,62/40"); UiFeature(F_CHARGE); >;
+    float g_flChargeSpiral < UiType(Slider); Default(0.3); Range(-2.0, 2.0); UiGroup("Charge,62/50"); UiFeature(F_CHARGE); >;
+    bool g_bChargeInsideSync < UiType(CheckBox); Default(1); UiGroup("Charge,62/60"); UiFeature(F_CHARGE); >;
+    bool g_bChargeInsideInward < UiType(CheckBox); Default(1); UiGroup("Charge,62/70"); UiFeature(F_CHARGE); >;
+    float g_flChargeInsideFlow < UiType(Slider); Default(0.4); Range(0.0, 4.0); UiGroup("Charge,62/80"); UiFeature(F_CHARGE); >;
+
+    // ------------------------------------------------------------------------------------------ heat haze
+    // Round the core, out to its Width (vertex stage): what is behind bent by a shimmer streaming outward. Strength how
+    // far it bends, Blur how much it smears (pixels of a 1080 line picture), Speed how fast it streams, Ripples how
+    // many round the core; Glow a faint light in the rim's colour (its cycle too), heat given off (0: clear).
+    float g_flHeatHazeStrength < UiType(Slider); Default(1.0); Range(0.0, 40.0); UiGroup("Heat Haze,70/20"); UiFeature(F_HEAT_HAZE); >;
+    float g_flHeatHazeBlur < UiType(Slider); Default(12.0); Range(0.0, 40.0); UiGroup("Heat Haze,70/30"); UiFeature(F_HEAT_HAZE); >;
+    float g_flHeatHazeSpeed < UiType(Slider); Default(1.0); Range(0.0, 8.0); UiGroup("Heat Haze,70/40"); UiFeature(F_HEAT_HAZE); >;
+    float g_flHeatHazeRipples < UiType(Slider); Default(10.0); Range(2.0, 64.0); UiGroup("Heat Haze,70/50"); UiFeature(F_HEAT_HAZE); >;
+    float g_flHeatHazeGlow < UiType(Slider); Default(0.0); Range(0.0, 100.0); UiGroup("Heat Haze,70/60"); UiFeature(F_HEAT_HAZE); >;
+
+    // ------------------------------------------------------------------------------------------ edges
+    // Where the surface meets the scene behind it, it fades into it over this many units (0: a hard line).
+    float g_flSoftEdge < UiType(Slider); Default(4.0); Range(0.0, 64.0); UiGroup("Rendering,90/10"); >;
+
+    // ------------------------------------------------------------------------------------------ noise
+    // A cell's random direction (PCG hash), its cell wrapped to the period so the noise tiles.
+    float2 Gradient(int2 cell, int2 period)
+    {
+        const uint2 c = (uint2)(((cell % period) + period) % period);
+        uint h = c.x * 747796405u + c.y * 2891336453u + 277803737u;
+        h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+        h = (h >> 22u) ^ h;
+        float s, k;
+        sincos((h & 0xffffu) * (6.2831853 / 65536.0), s, k);
+        return float2(k, s);
+    }
+
+    // Gradient noise at p (about -0.7..0.7) and its derivatives, tiling every period cells.
+    float3 Noise(float2 p, int2 period)
+    {
+        const int2 i = (int2)floor(p);
+        const float2 f = p - floor(p);
+        const float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+        const float2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+        const float2 ga = Gradient(i, period), gb = Gradient(i + int2(1, 0), period);
+        const float2 gc = Gradient(i + int2(0, 1), period), gd = Gradient(i + int2(1, 1), period);
+        const float va = dot(ga, f), vb = dot(gb, f - float2(1.0, 0.0));
+        const float vc = dot(gc, f - float2(0.0, 1.0)), vd = dot(gd, f - 1.0);
+        const float k = va - vb - vc + vd;
+        const float value = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k;
+        const float2 d = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) +
+                         du * (float2(vb - va, vc - va) + u.yx * k);
+        return float3(value, d);
+    }
+
+    // Four octaves over uv, scale cells across (rounded: it tiles); the finer ones weighted by detail. x the height,
+    // yz its slope over uv.
+    float3 Turbulence(float2 uv, float scale, float detail)
+    {
+        float3 sum = 0.0;
+        float weight = 1.0, total = 0.0;
+        int period = max((int)round(scale), 1);
+        [unroll] for (int o = 0; o < 4; o++)
+        {
+            const float3 n = Noise(uv * period, int2(period, period));
+            sum += weight * float3(n.x, n.yz * period);
+            total += weight;
+            weight *= detail;
+            period *= 2;
+        }
+        return sum / max(total, 1e-4);
+    }
+
+    // The turbulence carried along the flow, in two phases half a cycle apart, each restarting while it is unseen.
+    float3 FlowingTurbulence(float2 uv, float time)
+    {
+        const float2 flow = (g_tFlow.SampleGrad(g_sWrap, uv, s_vUvDdx, s_vUvDdy).rg * 2.0 - 1.0) + g_vFlowDirection;
+        const float t = time * g_flFlowSpeed / g_flFlowCycle;
+        const float a = frac(t), b = frac(t + 0.5);
+        const float wa = 1.0 - abs(a * 2.0 - 1.0);
+        const float3 na = Turbulence(uv - flow * a * g_flFlowCycle, g_flTurbulenceScale, g_flTurbulenceDetail);
+        const float3 nb = Turbulence(uv - flow * b * g_flFlowCycle + 0.37, g_flTurbulenceScale, g_flTurbulenceDetail);
+        return lerp(nb, na, wa);
+    }
+
+    // Out and in across the disc as the eye sees it: edge (0 the middle, 1 the outline) and the angle round it (0..1).
+    // Two noises, one carried outward along edge and one inward, each stretched along its way; -1..1 or so.
+    float RadialFlow(float edge, float around, float time)
+    {
+        const int tongues = max((int)round(g_flRimRadialDetail), 1);
+        const float k = 6.0, s = g_flRimRadialSpeed * k;
+        const float outward = Noise(float2(around * tongues, edge * k - time * s), int2(tongues, 1 << 16)).x +
+                              0.5 * Noise(float2(around * tongues * 2.0, edge * k * 2.0 - time * s * 1.7), int2(tongues * 2, 1 << 16)).x;
+        const float inward = Noise(float2(around * tongues + 0.37, edge * k * 1.3 + time * s * 0.8 + 11.0), int2(tongues, 1 << 16)).x;
+        return (outward + inward) * 1.4;
+    }
+
+    // The pulse's strength now, 0..1: a heartbeat's two beats (the second smaller) or a slow breath.
+    float Pulse(float time)
+    {
+        const float phase = frac(time * g_flRimPulseRate / 60.0);
+        if (!g_bRimHeartbeat)
+            return 0.5 - 0.5 * cos(phase * 6.2831853);
+        const float a = (phase - 0.08) / 0.07, b = (phase - 0.32) / 0.08;
+        return saturate(exp(-a * a) + 0.65 * exp(-b * b));
+    }
+
+    // The ring's breath now: x how far it moves out (+) or in (-), y how much it thickens (+) or thins (-), about
+    // -1..1. Slow swells of the whole, and a slower change of its shape round the disc (around: 0..1, three lobes).
+    float2 Breath(float around, float time)
+    {
+        const float t = time * g_flRimBreatheSpeed;
+        const int2 wide = int2(1 << 16, 1 << 16);
+        const float whole = Noise(float2(t * 0.6, 0.37), wide).x + 0.4 * sin(t * 1.9);
+        const float shape = Noise(float2(around * 3.0, t * 0.45 + 5.0), int2(3, 1 << 16)).x;
+        const float thick = Noise(float2(t * 0.8 + 3.0, 1.7), wide).x;
+        return float2(whole + shape * 0.8, thick * 1.2);
+    }
+
+    // Streaks streaming out (way 1) or in (way -1) across the disc at speed: r the distance from the middle on the
+    // screen (1 at the outline), around the angle round it (0..1), cells how many round it. The Charge's Spiral winds
+    // them round as they go. -1..1 or so.
+    float Stream(float r, float around, float time, float way, float speed, float cells)
+    {
+        const int n = max((int)round(cells), 1);
+        const float wound = around + g_flChargeSpiral * r;
+        const float t = time * speed * way;
+        return Noise(float2(wound * n, r * 6.0 - t * 3.0), int2(n, 1 << 16)).x * 1.2 +
+               Noise(float2(wound * n * 2.0 + 0.5, r * 12.0 - t * 5.0), int2(n * 2, 1 << 16)).x * 0.6;
+    }
+
+    // The Charge's rings now, the newest in x and the one before it in y: where each is (screen radius; home: its
+    // Position as one), and in bright how much of it there is (it fades in as it sets out and out as it arrives, and
+    // brightens on the way). Each one goes one way only, for Cycle seconds; the next sets out as the last one fades,
+    // so it loops without coming back.
+    float2 ChargeRings(float time, float home, out float2 bright, out float2 there)
+    {
+        const float overlap = 0.25;
+        const float life = max(g_flChargeCycle, 1e-3);
+        const float every = life * (1.0 - overlap);
+        const float newest = floor(time / every);
+        const float from = g_bChargeInward ? home : g_flChargeStart;
+        const float to = g_bChargeInward ? g_flChargeStart : home;
+        float2 at;
+        [unroll] for (int k = 0; k < 2; k++)
+        {
+            const float age = saturate((time - (newest - k) * every) / life);
+            at[k] = lerp(from, to, age);
+            there[k] = smoothstep(0.0, overlap, age) * (1.0 - smoothstep(1.0 - overlap, 1.0, age));
+            bright[k] = there[k] * lerp(0.6, 1.3, age);
+        }
+        return at;
+    }
+
+    // Hue (0..1), saturation and value; the value may be above 1.
+    float3 RgbToHsv(float3 c)
+    {
+        const float hi = max(c.r, max(c.g, c.b)), lo = min(c.r, min(c.g, c.b)), d = hi - lo;
+        float h = 0.0;
+        if (d > 1e-6)
+            h = hi == c.r ? (c.g - c.b) / d : hi == c.g ? 2.0 + (c.b - c.r) / d : 4.0 + (c.r - c.g) / d;
+        return float3(frac(h / 6.0), hi > 1e-6 ? d / hi : 0.0, hi);
+    }
+
+    float3 HsvToRgb(float3 c)
+    {
+        const float3 k = saturate(abs(frac(c.x + float3(0.0, 2.0, 1.0) / 3.0) * 6.0 - 3.0) - 1.0);
+        return c.z * lerp(1.0, k, c.y);
+    }
+
+    // c (a colour of the rim) turned toward the cycle colour by w (0..1): its hue toward the cycle colour's, its
+    // saturation scaled by the cycle colour's, its brightness by the cycle colour's over the rim colour's.
+    float3 TowardCycle(float3 c, float3 rim, float3 to, float w)
+    {
+        if (w <= 0.0)
+            return c;
+        const float3 a = RgbToHsv(rim), b = RgbToHsv(to), x = RgbToHsv(c);
+        // Each hue the shorter way round; one near the far side goes the way the rim colour's goes (by yellow and
+        // green when the rim colour is grey), so neighbouring hues do not part.
+        const bool back = a.y > 0.1 && frac(b.x - a.x) > 0.5;
+        float turn = frac(b.x - x.x + 0.5) - 0.5;
+        if (abs(turn) > 0.4)
+            turn = back ? frac(b.x - x.x) - 1.0 : frac(b.x - x.x);
+        return HsvToRgb(float3(frac(x.x + turn * w), x.y * lerp(1.0, b.y, w), x.z * lerp(1.0, b.z / max(a.z, 1e-3), w)));
+    }
+
+    // A smooth field bent twice by coarser noise (domain warp) and carried by the flow: its contour lines curl round
+    // like liquid stirred, the streaks of Source 1's Core.
+    float SwirlField(float2 uv, float time)
+    {
+        const float scale = max(g_flTurbulenceScale, 1.0);
+        const float3 w1 = Turbulence(uv + 0.23, max(scale * 0.5, 1.0), 0.0);
+        const float3 w2 = Turbulence(uv + w1.yz * (0.25 / scale) + 0.61, scale, 0.0);
+        const float2 flow = (g_tFlow.SampleGrad(g_sWrap, uv, s_vUvDdx, s_vUvDdy).rg * 2.0 - 1.0) + g_vFlowDirection;
+        const float tt = time * g_flFlowSpeed / g_flFlowCycle;
+        const float a = frac(tt), b = frac(tt + 0.5);
+        const float wa = 1.0 - abs(a * 2.0 - 1.0);
+        const float2 bent = uv + (w1.yz + w2.yz) * (0.25 / scale);
+        const float fa = Turbulence(bent - flow * a * g_flFlowCycle, scale, 0.25).x;
+        const float fb = Turbulence(bent - flow * b * g_flFlowCycle + 0.37, scale, 0.25).x;
+        return lerp(fb, fa, wa) + w1.x * 0.5;
+    }
+
+    // Rounded cells: a dome in each cell of a Voronoi pattern (one jittered point per grid cell), its slope over uv.
+    float2 CellSlope(float2 uv, float scale)
+    {
+        const int period = max((int)round(scale), 1);
+        const float2 p = uv * period;
+        const int2 cell = (int2)floor(p);
+        float best = 1e9;
+        float2 toNearest = 0.0;
+        [loop] for (int y = -1; y <= 1; y++)
+            [loop] for (int x = -1; x <= 1; x++)
+            {
+                const int2 c = cell + int2(x, y);
+                const float2 d = (float2)c + Gradient(c, int2(period, period)) * 0.35 + 0.5 - p;
+                const float d2 = dot(d, d);
+                if (d2 < best)
+                {
+                    best = d2;
+                    toNearest = d;
+                }
+            }
+        // A dome falling away from the cell's point: its slope points back toward it.
+        return toNearest * 2.0 * period;
+    }
+
+    // The normal map carried by the flow (two phases, as the turbulence), its slope over uv.
+    float2 MapSlope(float2 uv, float time)
+    {
+        const float2 flow = (g_tFlow.SampleGrad(g_sWrap, uv, s_vUvDdx, s_vUvDdy).rg * 2.0 - 1.0) + g_vFlowDirection;
+        const float tt = time * g_flFlowSpeed / g_flFlowCycle;
+        const float a = frac(tt), b = frac(tt + 0.5);
+        const float wa = 1.0 - abs(a * 2.0 - 1.0);
+        const float2 dx = s_vUvDdx * g_flNormalTiling, dy = s_vUvDdy * g_flNormalTiling;
+        const float2 sa = DecodeNormal(g_tNormal.SampleGrad(g_sWrap, (uv - flow * a * g_flFlowCycle) * g_flNormalTiling, dx, dy).rg).xy;
+        const float2 sb = DecodeNormal(g_tNormal.SampleGrad(g_sWrap, (uv - flow * b * g_flFlowCycle + 0.37) * g_flNormalTiling, dx, dy).rg).xy;
+        return lerp(sb, sa, wa) * 8.0;
+    }
+
+    // The interior's liquid: three sources, each a drop falling in now and then at a new place (its own life of 4 to
+    // 7 s): its rings spread out behind a front that grows with its age, the whole swirled about it, rising and dying
+    // away over the life, each source with its own wavelength. x the height, yz its slope over uv, w how much a crest
+    // is here (for the glow). Distances wrap with the texture.
+    float4 Ripples(float2 uv, float time)
+    {
+        float4 sum = 0.0;
+        [unroll] for (int k = 0; k < 3; k++)
+        {
+            const float life = 4.0 + 3.0 * frac(k * 0.618034 + 0.3);
+            const float cycle = time / life + k * 0.37;
+            const float age = frac(cycle);
+            const int born = (int)floor(cycle);
+            const float2 seed = Gradient(int2(born * 13 + k * 101, k * 29 + 11), int2(1 << 16, 1 << 16));
+            const float2 centre = frac(seed * 0.5 + 0.5 + Gradient(int2(born, k * 7 + 1), int2(1 << 16, 1 << 16)) * 0.37);
+            float2 d = frac(uv - centre + 0.5) - 0.5;
+            const float r = max(length(d), 1e-4);
+            // The swirl: a turn about the source that is greatest near it.
+            const float turn = g_flInteriorSwirl * 2.0 * exp(-r * 8.0) * sin(time * 0.2 + born + k);
+            float s, c;
+            sincos(turn, s, c);
+            d = float2(d.x * c - d.y * s, d.x * s + d.y * c);
+            const float rr = max(length(d), 1e-4);
+            const float scale = g_flInteriorRippleScale * (0.7 + 0.6 * frac(seed.x * 7.13 + 0.5));
+            const float front = age * 0.45 + 0.02;
+            const float strength = sin(3.14159265 * age) * smoothstep(front, front - 0.08, rr) * exp(-rr * 4.0);
+            const float phase = 6.2831853 * (rr * scale - time * g_flInteriorRippleSpeed);
+            float sp, cp;
+            sincos(phase, sp, cp);
+            sum.x += sp * strength;
+            sum.yz += cp * 6.2831853 * scale * strength * (d / rr);
+            sum.w += pow(saturate(sp * 0.5 + 0.5), g_flInteriorGlowSharpness) * strength;
+        }
+        return sum * float4(0.33, 0.33, 0.33, 1.0) * g_flInteriorRipples;
+    }
+
+    // ------------------------------------------------------------------------------------------ screen
+    float2 InViewport(float2 pixel)
+    {
+        return clamp(pixel, g_vViewportOffset + 0.5, g_vViewportOffset + g_vViewportSize - 0.5);
+    }
+
+    float2 ScreenPixel(float3 worldPosition)
+    {
+        const float4 clip = mul(g_matWorldToProjectionMultiview[0], float4(worldPosition, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        const float2 ndc = clip.xy / max(clip.w, 1e-4);
+        return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * g_vViewportSize;
+    }
+
+    // The distance from the camera along direction to the scene's depth at a pixel (far away where nothing is drawn).
+    float SceneDistance(float2 pixel, float3 camera, float3 direction)
+    {
+        const float stored = g_tSceneDepth.Load(int3(InViewport(pixel), 0)).r;
+        const float d = (stored - g_flViewportMinZ) / (g_flViewportMaxZ - g_flViewportMinZ);
+        const float4 c = mul(g_matWorldToProjectionMultiview[0], float4(camera, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        const float4 r = mul(g_matWorldToProjectionMultiview[0], float4(direction, 0.0));
+        const float t = (c.z - d * c.w) / (d * r.w - r.z);
+        return t > 0.0 && t < 1e6 ? t : 1e6;
+    }
+
+    // The scene behind at a pixel, blurred over about radius pixels (the mip that wide, eight points round a ring).
+    float3 SceneBehind(float2 pixel, float radius)
+    {
+        float2 size;
+        float mips;
+        g_tFrameBufferCopyTexture.GetDimensions(0, size.x, size.y, mips);
+        const float2 inv = 1.0 / size;
+        const float lod = clamp(log2(max(radius * 0.5, 1.0)), 0.0, mips - 1.0);
+        float3 sum = g_tFrameBufferCopyTexture.SampleLevel(g_sClampLinear, InViewport(pixel) * inv, lod).rgb;
+        if (radius < 1.0)
+            return sum;
+        [unroll] for (int k = 0; k < 8; k++)
+        {
+            float s, c;
+            sincos(k * 0.785398, s, c);
+            sum += g_tFrameBufferCopyTexture.SampleLevel(g_sClampLinear, InViewport(pixel + float2(c, s) * radius * 0.6) * inv, lod).rgb;
+        }
+        return sum / 9.0;
+    }
+
+    float3 Graded(float3 c, float contrast, float saturation)
+    {
+        c = lerp(c, c * c, contrast);
+        const float grey = dot(c, float3(0.2126, 0.7152, 0.0722));
+        return lerp(grey.xxx, c, saturation);
+    }
+
+    // Heat Haze, outside the core: what is behind bent by a shimmer streaming outward (away: 0 at the core's outline, 1
+    // at the shell's), blurred as much as it is bent, and a faint glow fading outward from the core.
+    float4 HazePixel(PixelInput i, float3 nShell, float away, float3 v, float3 camera, float shellDistance, float time,
+                     float3 glowColor)
+    {
+        const float2 pixel = i.vPositionPs.xy;
+        // Outward on the screen (y down), and the angle round the core.
+        const float3 nv = mul((float3x3)g_matWorldToView, nShell);
+        const float2 outward = normalize(float2(nv.x, -nv.y) + 1e-6);
+        const float2 sideways = float2(-outward.y, outward.x);
+        const float around = atan2(nv.y, nv.x) * 0.15915494 + 0.5;
+        // Two noises carried outward at different speeds; their slopes (round, out) are the shimmer's bend.
+        const int ripples = max((int)round(g_flHeatHazeRipples), 1);
+        const float s = time * g_flHeatHazeSpeed;
+        const float3 a = Noise(float2(around * ripples, away * 3.0 - s * 1.5), int2(ripples, 1 << 16));
+        const float3 b = Noise(float2(around * ripples * 2.0 + 0.5, away * 6.0 - s * 2.3), int2(ripples * 2, 1 << 16));
+        const float2 wave = a.yz + b.yz;
+        // Strongest just off the core, none at the shell's outline; the blur reaches further out than the bend.
+        const float rise = smoothstep(0.0, 0.12, away);
+        const float fade = rise * (1.0 - away) * (1.0 - away);
+        float2 shift = (sideways * wave.x + outward * wave.y) * fade * g_flHeatHazeStrength * g_vViewportSize.y * 0.008;
+        if (SceneDistance(pixel + shift, camera, v) < shellDistance)
+            shift = 0.0;
+        float3 result = SceneBehind(pixel + shift, g_flHeatHazeBlur * rise * (1.0 - away) * g_vViewportSize.y / 1080.0);
+        // The glow, fogged as the scene there is (the fog's blends are straight lines in the colour).
+        const float3 glow = glowColor * g_flHeatHazeGlow * pow(1.0 - away, 3.0);
+        result += ApplyFog(glow, i.vPositionWs, pixel) - ApplyFog(0.0, i.vPositionWs, pixel);
+        // Fading into the scene where the shell goes into it, over the haze's width at least.
+        const float gap = SceneDistance(pixel, camera, v) - shellDistance;
+        result = lerp(SceneBehind(pixel, 0.0), result, saturate(gap / max(max(g_flSoftEdge, i.vExtra.y), 1e-3)));
+        return float4(result, 1.0);
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+        discard;
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float2 uv = i.vTexCoord;
+        s_vUvDdx = ddx(uv);
+        s_vUvDdy = ddy(uv);
+        const float time = g_flTime;
+        const float3 shellPoint = WorldPosition(i.vPositionWs);
+        const float3 camera = g_vCameraPositionWs;
+        const float shellDistance = length(shellPoint - camera);
+        const float3 v = (shellPoint - camera) / max(shellDistance, 1e-4);    // from the camera
+
+    #if S2VFX_DEBUG_ENERGY
+        // Test only: the parts' switches as the colour (red refraction, green rim, blue interior).
+        return float4(g_flRefractionOn, g_flRimOn, g_flInteriorOn, 1.0);
+    #endif
+        PixelInput frame = i;
+    #if S_RENDER_BACKFACES
+        if (dot(i.vNormalWs.xyz, camera - shellPoint) < 0.0)
+            frame.vNormalWs.xyz = -i.vNormalWs.xyz;
+    #endif
+        const float3 nShell = normalize(frame.vNormalWs.xyz);
+        const float2 pixel = i.vPositionPs.xy;
+
+        // The rim's colour now: turned toward the cycle colour and back over the Color Cycle (and the ramp's row).
+        const float3 rimColor = SrgbGammaToLinear(g_vRimColor);
+        const float3 cycleColor = SrgbGammaToLinear(g_vRimCycleColor);
+        const float cycleRow = g_flRimColorCycle > 0.0 ? 0.5 + 0.5 * sin(time * 6.2831853 / g_flRimColorCycle) : 0.5;
+        const float cycleTurn = g_flRimColorCycle > 0.0 ?
+            (0.5 - 0.5 * cos(time * 6.2831853 / g_flRimColorCycle)) * g_flRimCycleBlend : 0.0;
+        // The ring's own colour now (the middle of its ramp, at full strength, turned with the cycle), which the
+        // haze's glow and the shell's tint take.
+        float3 ringColor = rimColor * g_tRimRamp.SampleLevel(g_sClampLinear, float2(0.5, cycleRow), 0).rgb;
+        ringColor /= max(max(ringColor.r, max(ringColor.g, ringColor.b)), 1e-3);
+        const float3 ringNow = TowardCycle(ringColor, rimColor, cycleColor, cycleTurn);
+
+        // Heat Haze: the vertex stage pushed the surface out into a shell round the core (the core's share of its
+        // radius in vExtra.x, the haze's width in units in vExtra.y). A ray that misses the core is haze; one that
+        // meets it is the core, at the point and with the normal a sphere that much smaller has along it.
+        float3 p = shellPoint;
+        float3 nGeo = nShell;
+        float coreCover = 1.0;
+        const bool haze = g_flHeatHazeOn > 0.5 && i.vExtra.x < 0.9999 && i.vExtra.y > 0.0;
+        const float k = max(i.vExtra.x, 0.05);
+        const float facingShell = saturate(dot(nShell, -v));
+        const float sinShell = sqrt(saturate(1.0 - facingShell * facingShell));
+        const float sinCore = sinShell / k;
+        const float coverStep = max(fwidth(sinCore), 1e-4);
+        if (haze)
+        {
+            if (sinCore >= 1.0)
+                return HazePixel(i, nShell, saturate((sinShell - k) / max(1.0 - k, 1e-4)), v, camera, shellDistance, time,
+                                 ringNow);
+            const float3 across = sinShell > 1e-4 ? (nShell + v * facingShell) / sinShell : 0.0;
+            const float facingCore = sqrt(saturate(1.0 - sinCore * sinCore));
+            nGeo = normalize(-v * facingCore + across * sinCore);
+            p = shellPoint + v * (i.vExtra.y / (1.0 - k)) * (facingShell - k * facingCore);
+            // Antialiased into the haze over a pixel at the core's outline.
+            coreCover = saturate((1.0 - sinCore) / coverStep);
+        }
+        const float surfaceDistance = length(p - camera);
+        const float3 t = normalize(frame.vTangentWs - nGeo * dot(nGeo, frame.vTangentWs));
+        const float3 b = cross(nGeo, t) * (dot(cross(nGeo, t), frame.vBitangentWs) < 0.0 ? -1.0 : 1.0);
+
+        // The turbulence: its height (for the rim's raggedness) and the surface's normal bent by its slope.
+        float3 turb = FlowingTurbulence(uv, time);
+        float2 slope = turb.yz * 0.15;
+        if (g_flCells > 0.0)
+            slope += CellSlope(uv, g_flCellScale) * (g_flCells * 0.01);
+        if (g_flNormalStrength > 0.0)
+            slope += MapSlope(uv, time) * (g_flNormalStrength * 0.05);
+        const float3 n = normalize(nGeo - slope.x * t - slope.y * b);
+        const float facing = saturate(dot(nGeo, -v));
+        const float edge = 1.0 - facing;                                // 0 facing the eye, 1 the outline
+
+        // Dissolve: eaten away below the amount, a glowing edge just above it.
+        float3 glow = 0.0;
+        if (g_flDissolveOn > 0.5)
+        {
+            const float value = saturate(Turbulence(uv + 0.71, g_flDissolveScale, 0.5).x * 1.2 + 0.5);
+            if (value < g_flDissolve)
+                discard;
+            const float into = (value - g_flDissolve) / max(g_flDissolveEdgeWidth, 1e-4);
+            if (g_flDissolve > 0.0)
+                glow += SrgbGammaToLinear(g_vDissolveEdgeColor) * g_flDissolveEdgeBrightness * saturate(1.0 - into);
+        }
+
+        // The scene behind: bent by the turbulence as seen on screen and by the lens, unless the moved pixel's scene
+        // is in front of the surface (something standing before it).
+        float3 behind;
+        if (g_flRefractionOn > 0.5)
+        {
+            const float3 nView = mul((float3x3)g_matWorldToView, n - nGeo);
+            // Harder toward the outline with the Shell (the turbulence seen through more of the shell there).
+            const float edgeGain = g_flShellOn > 0.5 ? 1.0 + g_flShellEdgeRefraction * edge * edge : 1.0;
+            float2 shift = float2(nView.x, -nView.y) * g_flRefractStrength * edgeGain * g_vViewportSize.y * 0.05;
+            if (g_flRefractThickness > 0.0 && g_flRefractIor > 1.0)
+                shift += ScreenPixel(p + refract(v, n, 1.0 / g_flRefractIor) * g_flRefractThickness) -
+                         ScreenPixel(p + v * g_flRefractThickness);
+            if (SceneDistance(pixel + shift, camera, v) < surfaceDistance)
+                shift = 0.0;
+            const float radius = g_flRefractBlur * g_vViewportSize.y / 1080.0;
+            const float split = g_flRefractChromatic * 0.15;
+            behind.r = SceneBehind(pixel + shift * (1.0 + split), radius).r;
+            behind.g = SceneBehind(pixel + shift, radius).g;
+            behind.b = SceneBehind(pixel + shift * (1.0 - split), radius).b;
+            behind *= SrgbGammaToLinear(g_vRefractTint);
+        }
+        else
+            behind = SceneBehind(pixel, 0.0);
+        float3 result = behind;
+        // What of the colour is the scene behind as the frame copy has it (its fog in it already), and how much of
+        // it: followed through every blend below, so that only the rest is fogged at the end.
+        float3 passing = behind;
+        float copyShare = 1.0;
+
+        // The angle round the disc from the normal as the view sees it (for the radial flow, the breath and the
+        // Charge), and the distance from the middle on the screen (0 the middle, 1 the outline).
+        const float3 nv = mul((float3x3)g_matWorldToView, nGeo);
+        const float around = atan2(nv.y, nv.x) * 0.15915494 + 0.5;
+        const float onScreen = sqrt(saturate(1.0 - facing * facing));
+        // Charge: the ring's fire streams out (or in) across the disc instead of drifting with the turbulence.
+        const bool charging = g_flChargeOn > 0.5;
+        const float way = g_bChargeInward ? -1.0 : 1.0;
+        const bool streaming = charging && g_flChargeFlow > 0.0;
+        const float stream = streaming ? Stream(onScreen, around, time, way, g_flChargeFlow, 12.0) : 0.0;
+        // The dark middle's own stream (the ring's way and speed when in sync).
+        const bool insideSync = g_bChargeInsideSync;
+        const float insideWay = insideSync ? way : (g_bChargeInsideInward ? -1.0 : 1.0);
+        const float insideFlow = insideSync ? g_flChargeFlow : g_flChargeInsideFlow;
+        const float insideStream = charging && insideFlow > 0.0 ? Stream(onScreen, around + 0.37, time, insideWay, insideFlow, 7.0) : 0.0;
+
+        // The rim's band in edge (Position, Width, ragged by the turbulence or the stream), and the side of it facing
+        // the eye.
+        float ragged = ((streaming ? stream : turb.x) * 0.5 + dot(slope, float2(0.7, 0.7)) * 0.15) * g_flRimNoise;
+        if (g_flRimOn > 0.5 && g_flRimStreaks > 0.0)
+            ragged += sin(6.2831853 * g_flRimStreakLines * SwirlField(uv, time)) * g_flRimStreaks * 0.06;
+        const float beat = g_flRimOn > 0.5 && g_flRimPulse > 0.0 ? Pulse(time) * g_flRimPulse : 0.0;
+        float radial = 0.0;
+        if (g_flRimOn > 0.5 && g_flRimRadialFlow > 0.0)
+        {
+            // Faded out toward the middle, where every angle meets (else it draws a star there).
+            radial = RadialFlow(edge, around, time) * g_flRimRadialFlow * smoothstep(0.05, 0.3, edge);
+            ragged += radial * 0.08;
+        }
+        const float2 breath = g_flRimOn > 0.5 && g_flRimBreathe > 0.0 ? Breath(around, time) * g_flRimBreathe : 0.0;
+        const float ringWidth = g_flRimWidth * (1.0 + 0.3 * beat) * max(1.0 + 0.6 * breath.y, 0.2);
+        // Where the ring is measured (ringAt, against inner and width): in edge, or with the Charge in screen radius,
+        // so it keeps its width as it travels to the middle (edge to screen radius at its Position: (1 - e) / s).
+        // Two rings, x and y: the second is only there on the Charge's journey (the one setting out as the last one
+        // arrives); bright how much of each there is, share how far each one's middle and outside count.
+        float ringAt = edge;
+        float width = ringWidth;
+        float2 inner = g_flRimPosition - ringWidth * 0.5 + ragged + breath.x * 0.15;
+        float2 insideEdge = inner;
+        float soft = max(g_flRimWidth * 0.5 * g_flRimSoftness, 1e-3);
+        float2 bright = float2(1.0, 0.0);
+        float2 share = float2(1.0, 0.0);
+        if (charging)
+        {
+            const float home = sqrt(saturate(1.0 - (1.0 - g_flRimPosition) * (1.0 - g_flRimPosition)));
+            const float scale = (1.0 - g_flRimPosition) / max(home, 1e-3);
+            const float shake = (ragged + breath.x * 0.15) * scale;
+            float2 centre = home;
+            if (g_flChargeCycle > 0.0)
+            {
+                float2 there;
+                centre = ChargeRings(time, home, bright, there);
+                share = there / max(there.x + there.y, 1e-4);
+            }
+            ringAt = onScreen;
+            width = ringWidth * scale;
+            soft *= scale;
+            inner = centre - width * 0.5 + shake;
+            // The dark middle with the ring, or at its own size; ragged by its own stream.
+            insideEdge = (insideSync ? inner : home - width * 0.5 + shake) + insideStream * 0.03 * scale;
+        }
+
+        // The interior: where the surface faces the eye inside the ring, a dark liquid seen Depth below it.
+        if (g_flInteriorOn > 0.5)
+        {
+            const float inside = g_flRimOn > 0.5 ?
+                dot(share, 1.0 - smoothstep(insideEdge - soft, insideEdge + soft, ringAt)) : 1.0;
+            const float3 toward = float3(dot(v, t), dot(v, b), max(dot(v, -nGeo), 0.2));
+            const float2 deep = uv + toward.xy / toward.z * g_flInteriorDepth;
+            // A coarse noise bends everything inside (domain warp): the rings are not true circles, and the swirls'
+            // folds do not line up with the noise's lattice (a grid across the texture). With the Charge its stream
+            // pushes it out (or in) as well: outward on the screen is the view's own way across the surface.
+            const float3 warp = Turbulence(deep + 0.23, max(g_flTurbulenceScale * 0.5, 1.0), 0.5);
+            const float2 outward = normalize(toward.xy + 1e-6) * smoothstep(0.0, 0.25, onScreen);
+            const float2 bent = deep + warp.yz * (0.15 / max(g_flTurbulenceScale, 1.0)) + outward * insideStream * 0.03;
+            const float4 rings = Ripples(bent, time);
+            const float3 swirl = FlowingTurbulence(bent + 0.5, time);
+            // Marble: the swirled field's contour lines (its height, bent again by itself).
+            const float marble = g_flInteriorMarble > 0.0 ?
+                pow(saturate(1.0 - abs(sin(3.14159265 * g_flInteriorMarbleLines * SwirlField(bent, time)))),
+                    g_flInteriorGlowSharpness) : 0.0;
+            const float3 ripple = rings.xyz + swirl * 0.3;
+            const float3 nIn = normalize(nGeo - (ripple.y * t + ripple.z * b) * 0.02);
+            // Its own light: the crests, and the swirls' folds (where the turbulence crosses its middle).
+            const float folds = pow(saturate(1.0 - abs(swirl.x) * 6.0), g_flInteriorGlowSharpness * 0.5);
+            // With the Charge, wisps of its stream glow too, so the dark itself is seen streaming.
+            const float wisps = charging ? pow(saturate(insideStream * 0.8 + 0.3), 4.0) * smoothstep(0.05, 0.4, onScreen) * 2.0 : 0.0;
+            const float3 ownGlow = SrgbGammaToLinear(g_vInteriorGlowColor) * g_flInteriorGlow *
+                                   (rings.w + folds * g_flInteriorSwirlLines + marble * g_flInteriorMarble + wisps);
+            LightingSurface core = LitSurface(i, 0.0, nIn, 0.05, 0.0, 1.0);
+            core.specularColor = 0.04;
+            const float3 shine = AmbientSpecular(core, AmbientDiffuse(core)) * g_flInteriorReflectivity *
+                                 SrgbGammaToLinear(g_vInteriorReflectionTint);
+            const float3 interior = SrgbGammaToLinear(g_vInteriorColor) + shine + ownGlow;
+            result = lerp(result, interior, inside * g_flInteriorOpacity);
+            passing *= 1.0 - inside * g_flInteriorOpacity;
+            copyShare *= 1.0 - inside * g_flInteriorOpacity;
+        }
+
+        // The shell outside the ring, a thin film of energy: a glow along the outline, and fine streaks where the
+        // turbulence folds (with the Charge, where its stream does: they shoot out or in), crackling on and off in
+        // patches; its colours lean to the ring's by Rim Tint.
+        if (g_flShellOn > 0.5)
+        {
+            const float outside = g_flRimOn > 0.5 ? dot(share, smoothstep(inner + width - soft, inner + width + soft, ringAt)) : 1.0;
+            const float outline = pow(edge, max(16.0 / g_flShellGlowWidth, 1.0));
+            const float folds = streaming ? Stream(onScreen, around + 0.71, time, way, g_flChargeFlow, 20.0) * 0.6 : turb.x;
+            const float lit = g_flShellCrackle > 0.0 ?
+                saturate((Noise(uv * 4.0 + time * float2(0.9, -0.6), int2(4, 4)).x + 0.7 - 1.4 * g_flShellCrackle) * 4.0) : 1.0;
+            const float streak = pow(saturate(1.0 - abs(folds) * 4.0), g_flShellStreakSharpness) * lit;
+            // A film: thin where it faces the eye, thickest at the outline.
+            const float milk = outside * g_flShellOpacity * edge * edge;
+            result = lerp(result, lerp(SrgbGammaToLinear(g_vShellColor), ringNow, g_flShellRimTint) * g_flShellBrightness, milk);
+            passing *= 1.0 - milk;
+            copyShare *= 1.0 - milk;
+            glow += outside * (lerp(SrgbGammaToLinear(g_vShellGlowColor), ringNow, g_flShellRimTint) * g_flShellGlow * outline +
+                               lerp(SrgbGammaToLinear(g_vShellStreakColor), ringNow, g_flShellRimTint) * g_flShellStreaks *
+                               streak * (0.3 + 0.7 * edge));
+        }
+
+        // The rim: the band's light, coloured across it by the ramp, flickering with the turbulence (or the stream).
+        if (g_flRimOn > 0.5)
+        {
+            // It flares with the blob's surges (vExtra.z, 0 without the Blob), and brightens on the Charge's way.
+            const float flicker = (0.6 + 0.8 * saturate((streaming ? stream : turb.x) + 0.5)) * (1.0 + 1.5 * beat) *
+                                  (1.0 + 0.6 * radial) * (1.0 + 0.5 * i.vExtra.z);
+            float cover = 0.0;
+            [unroll] for (int r = 0; r < 2; r++)
+            {
+                if (bright[r] <= 0.0)
+                    continue;
+                const float outer = inner[r] + width;
+                const float band = smoothstep(inner[r] - soft, inner[r] + soft, ringAt) *
+                                   (1.0 - smoothstep(outer - soft, outer + soft, ringAt)) * bright[r];
+                const float across = saturate((ringAt - inner[r]) / max(width, 1e-4) - 0.12 * beat + radial * 0.12 + stream * 0.08);
+                const float3 ramp = g_tRimRamp.SampleLevel(g_sClampLinear, float2(across, cycleRow), 0).rgb;
+                glow += TowardCycle(rimColor * ramp, rimColor, cycleColor, cycleTurn) * g_flRimBrightness * band * flicker;
+                cover = max(cover, saturate(band));
+            }
+            result *= 1.0 - cover * g_flRimOpacity;
+            passing *= 1.0 - cover * g_flRimOpacity;
+            copyShare *= 1.0 - cover * g_flRimOpacity;
+        }
+        result += glow;
+
+        // Reflection on top, by the IOR's Fresnel on the turbulent surface.
+        if (g_flReflectionOn > 0.5)
+        {
+            const float r0 = (g_flReflectionIor - 1.0) / (g_flReflectionIor + 1.0);
+            LightingSurface s = LitSurface(i, 0.0, n, g_flReflectionRoughness, 0.0, 1.0);
+            s.specularColor = r0 * r0;
+            SpecularEnergy(s);
+            const DirectLight direct = DirectLighting(s);
+            const float3 reflection = (direct.specular * s.directSpecularOcclusion + AmbientSpecular(s, AmbientDiffuse(s))) *
+                                      s.specularEnergy;
+            result += Graded(reflection, g_flReflectionContrast, g_flReflectionSaturation) *
+                      SrgbGammaToLinear(g_vReflectionTint) * g_flReflectionStrength;
+        }
+
+        // Fading into the scene where they meet: the scene straight behind, as close as it comes.
+        if (g_flSoftEdge > 0.0)
+        {
+            const float gap = SceneDistance(pixel, camera, v) - surfaceDistance;
+            const float t = saturate(gap / g_flSoftEdge);
+            const float3 seen = SceneBehind(pixel, 0.0);
+            result = lerp(seen, result, t);
+            passing = lerp(seen, passing, t);
+            copyShare = lerp(1.0, copyShare, t);
+        }
+        // Only the energy's own light is fogged: what is seen through it has its fog already.
+        result = ApplyFogSeeThrough(result - passing, passing, 1.0 - copyShare, i.vPositionWs, i.vPositionPs.xy);
+        if (haze)
+            result = lerp(SceneBehind(pixel, 0.0), result, coreCover);
+        return float4(result, 1.0);
+    }
+#endif
+}

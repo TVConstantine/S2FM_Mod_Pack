@@ -1,0 +1,570 @@
+// Water: waves worked out from the world position (no texture needed), the scene below read from the frame copy and
+// bent by the waves, coloured by how far the light goes through the water (decay) and fogged by the light scattered
+// in it, caustics on the floor below, foam where it is shallow, a soft shore, and reflections and highlights from the
+// engine's own lights and environment maps. The frame copy and the scene's depth are made by the mod pack for any
+// shader that reads them (Alyx makes neither for a see-through surface). The set of controls follows Counter-Strike
+// 2's water (csgo_water_fancy); the code is this project's own.
+//
+// Screen space: what is not on the screen below the water is not in it. The surface is flat; the waves are in its
+// lighting, not its shape.
+
+HEADER
+{
+    Description = "Water: waves, refraction, depth colour, caustics and shore foam under the engine's lights";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    Feature(F_RENDER_BACKFACES, 0..1, "Rendering");
+}
+
+COMMON
+{
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    #include "s2vfx/vertex.hlsl"
+
+    BoolAttribute(environmentmapped, true);
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_RENDER_BACKFACES, F_RENDER_BACKFACES, Sys(ALL));
+
+    RenderState(CullMode, S_RENDER_BACKFACES ? NONE : DEFAULT);
+    BoolAttribute(renderbackfaces, S_RENDER_BACKFACES ? true : false);
+    BoolAttribute(translucent, true);
+    BoolAttribute(NoZPrepass, true);
+    // The surface's depth is written (the engine's see-through mode would not): what is drawn after it behind the
+    // water stays behind it, and the mod pack finds what touches the water by the depth before and after its draw.
+    RenderState(DepthWriteEnable, true);
+
+    #define S2VFX_NO_DYNAMIC_AO 1
+    #include "s2vfx/lighting.hlsl"
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"
+
+    // ------------------------------------------------------------------------------------------ waves
+    // A sum of waves, each turned from the one before and shorter, with sharp crests (Sharpness). Scale is the longest
+    // wavelength in world units; the iterations are split into a long, a middle and a short third, each with its weight.
+    float g_flWaveScale < UiType(Slider); Default(150.0); Range(5.0, 2000.0); UiGroup("Waves,20/10"); >;
+    float g_flWaveIterations < UiType(Slider); Default(18.0); Range(1.0, 40.0); UiGroup("Waves,20/20"); >;
+    float g_flLowFreqWeight < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Waves,20/30"); >;
+    float g_flMedFreqWeight < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Waves,20/40"); >;
+    float g_flHighFreqWeight < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Waves,20/50"); >;
+    float g_flWaveDirection < UiType(Slider); Default(1.5); Range(0.0, 6.3); UiGroup("Waves,20/60"); >;
+    float g_flWaveSpeed < UiType(Slider); Default(1.0); Range(-8.0, 8.0); UiGroup("Waves,20/70"); >;
+    float g_flWaveSharpness < UiType(Slider); Default(0.5); Range(0.0, 2.0); UiGroup("Waves,20/80"); >;
+    float g_flWaveNormalStrength < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Waves,20/90"); >;
+
+    // ------------------------------------------------------------------------------------------ detail normal
+    // A normal map over the waves (a Source 1 water's, say), tiled every Scale units in the world and scrolled at
+    // Scroll Speed tiles a second toward Scroll Direction (radians). It may be a flipbook: Frames frames laid in a grid
+    // Columns wide (left to right, then down), played at Frame Rate, each blended into the next.
+    bool g_bDetailNormal < UiType(CheckBox); Default(0); UiGroup("Detail Normal,25/5"); >;
+    float g_flDetailNormalStrength < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Detail Normal,25/20"); >;
+    float g_flDetailNormalScale < UiType(Slider); Default(128.0); Range(4.0, 2000.0); UiGroup("Detail Normal,25/30"); >;
+    float g_flDetailScrollSpeed < UiType(Slider); Default(0.1); Range(0.0, 4.0); UiGroup("Detail Normal,25/40"); >;
+    float g_flDetailScrollDirection < UiType(Slider); Default(0.785); Range(0.0, 6.3); UiGroup("Detail Normal,25/50"); >;
+    float g_flDetailFrames < UiType(Slider); Default(1.0); Range(1.0, 64.0); UiGroup("Detail Normal,25/60"); >;
+    float g_flDetailColumns < UiType(Slider); Default(1.0); Range(1.0, 16.0); UiGroup("Detail Normal,25/70"); >;
+    float g_flDetailFrameRate < UiType(Slider); Default(25.0); Range(0.0, 60.0); UiGroup("Detail Normal,25/80"); >;
+    CreateInputTexture2D(TextureDetailNormal, Linear, 8, "NormalizeNormals", "_normal", "Detail Normal,25/10", Default3(0.5, 0.5, 1.0));
+    Texture2D g_tDetailNormal < Channel(RG, HemiOctIsoRoughness_RG_B(TextureDetailNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ water colour
+    // Decay: the colour light keeps after Decay Distance through the water (Beer-Lambert). Fog: the light scattered in
+    // the water, Fog Color lit by the scene's light, thickening over Fog Distance.
+    float3 g_vWaterDecayColor < UiType(Color); Default3(0.30, 0.65, 0.70); UiGroup("Water Color,30/10"); >;
+    float g_flWaterDecayDistance < UiType(Slider); Default(60.0); Range(1.0, 2000.0); UiGroup("Water Color,30/20"); >;
+    float3 g_vWaterFogColor < UiType(Color); Default3(0.05, 0.22, 0.25); UiGroup("Water Color,30/30"); >;
+    float g_flWaterFogDistance < UiType(Slider); Default(250.0); Range(1.0, 5000.0); UiGroup("Water Color,30/40"); >;
+
+    // ------------------------------------------------------------------------------------------ refraction
+    float g_flRefraction < UiType(Slider); Default(1.0); Range(0.0, 4.0); UiGroup("Refraction,40/10"); >;
+    float g_flRefractChromaticSeparation < UiType(Slider); Default(0.3); Range(0.0, 1.0); UiGroup("Refraction,40/20"); >;
+    float g_flShoreSoftness < UiType(Slider); Default(2.0); Range(0.0, 50.0); UiGroup("Refraction,40/30"); >;
+
+    // ------------------------------------------------------------------------------------------ reflections
+    float g_flIor < UiType(Slider); Default(1.33); Range(1.0, 2.0); UiGroup("Reflections,50/10"); >;
+    float g_flRoughness < UiType(Slider); Default(0.05); Range(0.0, 1.0); UiGroup("Reflections,50/20"); >;
+    float g_flReflectance < UiType(Slider); Default(1.0); Range(0.0, 4.0); UiGroup("Reflections,50/30"); >;
+    // Screen space reflections: what is on the screen reflected as it is, the environment map where the ray finds
+    // nothing (off the screen, the sky, behind something). Distance is how far a ray goes, Thickness how deep behind
+    // the scene's depth a crossing still counts as a hit, Steps how many it takes, Edge Fade the share of the screen
+    // at its edge over which the reflection fades into the environment map.
+    bool g_bScreenSpaceReflections < UiType(CheckBox); Default(1); UiGroup("Reflections,50/40"); >;
+    float g_flSsrDistance < UiType(Slider); Default(3000.0); Range(50.0, 20000.0); UiGroup("Reflections,50/50"); >;
+    float g_flSsrThickness < UiType(Slider); Default(40.0); Range(1.0, 1000.0); UiGroup("Reflections,50/60"); >;
+    float g_flSsrSteps < UiType(Slider); Default(40.0); Range(8.0, 128.0); UiGroup("Reflections,50/70"); >;
+    float g_flSsrEdgeFade < UiType(Slider); Default(0.1); Range(0.01, 0.5); UiGroup("Reflections,50/80"); >;
+
+    // ------------------------------------------------------------------------------------------ caustics
+    // The light the waves focus onto the floor below: as bright as Strength, sharper with Sharpness, fading over
+    // Depth Fall Off from the surface.
+    bool g_bCaustics < UiType(CheckBox); Default(1); UiGroup("Caustics,60/5"); >;
+    float g_flCausticsStrength < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Caustics,60/10"); >;
+    float g_flCausticScale < UiType(Slider); Default(0.5); Range(0.05, 4.0); UiGroup("Caustics,60/20"); >;
+    float g_flCausticSharpness < UiType(Slider); Default(4.0); Range(1.0, 16.0); UiGroup("Caustics,60/30"); >;
+    float g_flCausticDepthFallOffDistance < UiType(Slider); Default(100.0); Range(1.0, 1000.0); UiGroup("Caustics,60/40"); >;
+    float3 g_vCausticsTint < UiType(Color); Default3(0.8, 1.0, 1.0); UiGroup("Caustics,60/50"); >;
+
+    // ------------------------------------------------------------------------------------------ debris
+    // A layer floating on the water (algae, scum, leaves), tiled in the world every Debris Scale units and drifting
+    // with the waves (Wobble). Where it lies comes from its height texture: the higher parts first, as much as Debris
+    // Amount says, with edges as sharp as Edge Sharpness. It is lit as a rough surface on its own normal map; Oiliness
+    // keeps some of the water's shine on it, Reflectance how much of the water's reflection shows through.
+    bool g_bDebris < UiType(CheckBox); Default(0); UiGroup("Debris,65/5"); >;
+    float3 g_vDebrisTint < UiType(Color); Default3(0.7, 0.7, 0.7); UiGroup("Debris,65/20"); >;
+    float g_flDebrisAmount < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Debris,65/30"); >;
+    float g_flDebrisEdgeSharpness < UiType(Slider); Default(4.0); Range(0.1, 20.0); UiGroup("Debris,65/40"); >;
+    float g_flDebrisScale < UiType(Slider); Default(128.0); Range(1.0, 2000.0); UiGroup("Debris,65/50"); >;
+    float g_flDebrisWobble < UiType(Slider); Default(1.0); Range(0.0, 8.0); UiGroup("Debris,65/60"); >;
+    // The debris drifts: Drift Speed world units a second toward Drift Direction (radians), and slowly churns in place.
+    float g_flDebrisDriftSpeed < UiType(Slider); Default(2.0); Range(0.0, 50.0); UiGroup("Debris,65/62"); >;
+    float g_flDebrisDriftDirection < UiType(Slider); Default(0.8); Range(0.0, 6.3); UiGroup("Debris,65/64"); >;
+    float g_flDebrisNormalStrength < UiType(Slider); Default(1.0); Range(0.0, 10.0); UiGroup("Debris,65/70"); >;
+    float g_flDebrisOiliness < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Debris,65/80"); >;
+    float g_flDebrisReflectance < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Debris,65/90"); >;
+    CreateInputTexture2D(TextureDebris, Srgb, 8, "", "_color", "Debris,65/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureDebrisHeight, Linear, 8, "", "_mask", "Debris,65/11", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureDebrisNormal, Linear, 8, "NormalizeNormals", "_normal", "Debris,65/12", Default3(0.5, 0.5, 1.0));
+    Texture2D g_tDebris < Channel(RGB, Box(TextureDebris), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    Texture2D g_tDebrisHeight < Channel(R, Box(TextureDebrisHeight), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+    Texture2D g_tDebrisNormal < Channel(RG, HemiOctIsoRoughness_RG_B(TextureDebrisNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ foam
+    // Foam: at the shore (shallower than Foam Distance) and where something moves in the water (Interaction). Its look
+    // is the foam texture: a height (how thick the foam is; as it thins out the thin parts go first and the thick
+    // veins last) and its normal, tiled every Foam Scale units in two drifting layers, bent with the waves by Foam
+    // Wobble, lit as a rough surface on that normal. Without a texture (white) it is a plain sheet.
+    bool g_bFoam < UiType(CheckBox); Default(1); UiGroup("Foam,70/5"); >;
+    float3 g_vFoamColor < UiType(Color); Default3(0.85, 0.88, 0.9); UiGroup("Foam,70/20"); >;
+    float g_flFoamDistance < UiType(Slider); Default(6.0); Range(0.0, 100.0); UiGroup("Foam,70/30"); >;
+    float g_flFoamScale < UiType(Slider); Default(96.0); Range(1.0, 1000.0); UiGroup("Foam,70/40"); >;
+    float g_flFoamWobble < UiType(Slider); Default(1.0); Range(0.0, 8.0); UiGroup("Foam,70/50"); >;
+    float g_flFoamSharpness < UiType(Slider); Default(3.0); Range(0.5, 20.0); UiGroup("Foam,70/60"); >;
+    CreateInputTexture2D(TextureFoam, Linear, 8, "", "_mask", "Foam,70/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureFoamNormal, Linear, 8, "NormalizeNormals", "_normal", "Foam,70/11", Default3(0.5, 0.5, 1.0));
+    Texture2D g_tFoam < Channel(R, Box(TextureFoam), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+    Texture2D g_tFoamNormal < Channel(RG, HemiOctIsoRoughness_RG_B(TextureFoamNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+    SamplerState g_sWrap < Filter(ANISOTROPIC); MaxAniso(8); AddressU(WRAP); AddressV(WRAP); >;
+
+    // ------------------------------------------------------------------------------------------ interaction
+    // What touches the water: ripples spread from it, the debris is pushed aside and drifts back, foam. The map is
+    // worked out by the mod pack (refraction/water_fx.cpp) over the world, repeating every 2048 units; without it the
+    // stand in is black and nothing happens.
+    bool g_bInteraction < UiType(CheckBox); Default(1); UiGroup("Interaction,68/5"); >;
+    float g_flRippleStrength < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Interaction,68/10"); >;
+    float g_flInteractionFoam < UiType(Slider); Default(1.0); Range(0.0, 2.0); UiGroup("Interaction,68/20"); >;
+    float g_flDebrisClearing < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Interaction,68/30"); >;
+    CreateInputTexture2D(TextureWaterEffects, Linear, 8, "", "_black_mask", "Interaction,68/90", Default3(0.0, 0.0, 0.0));
+    Texture2D g_tWaterEffects < Channel(RGBA, Box(TextureWaterEffects), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    SamplerState g_sEffects < Filter(MIN_MAG_MIP_LINEAR); AddressU(WRAP); AddressV(WRAP); >;
+
+    Texture2D g_tFrameBufferCopyTexture;
+    Texture2D g_tSceneDepth;
+    SamplerState g_sFrameCopy < Filter(MIN_MAG_MIP_LINEAR); AddressU(CLAMP); AddressV(CLAMP); >;
+
+    // The waves at a world position: x the height, yz its slope (d/dx, d/dy), w the curvature (the sum of the second
+    // derivatives), where the surface focuses light.
+    float4 Waves(float2 p, float time)
+    {
+        float4 sum = 0.0;
+        float weightSum = 0.0;
+        float angle = g_flWaveDirection;
+        float frequency = 6.2831853 / max(g_flWaveScale, 1.0);
+        float weight = 1.0;
+        const float k = 1.0 + g_flWaveSharpness * 4.0;
+        const int count = (int)clamp(g_flWaveIterations, 1.0, 40.0);
+        [loop] for (int i = 0; i < count; i++)
+        {
+            const float band = i * 3 < count ? g_flLowFreqWeight : (i * 3 < count * 2 ? g_flMedFreqWeight : g_flHighFreqWeight);
+            float s, c;
+            sincos(angle, s, c);
+            const float2 d = float2(c, s);
+            // Deep water waves travel at a speed that grows with their length: phase speed sqrt(g / k). Each its own
+            // phase (by the golden ratio), else all their crests meet at the origin in a star.
+            const float x = dot(d, p) * frequency + time * g_flWaveSpeed * sqrt(9.81 * 39.37 * frequency) + frac(i * 0.618034) * 6.2831853;
+            float sx, cx;
+            sincos(x, sx, cx);
+            const float e = exp(k * (sx - 1.0));                  // a sharp crest, 0..1
+            const float w = weight * band;
+            sum.x += w * e;
+            sum.yz += w * e * k * cx * frequency * d;
+            sum.w += w * e * k * (k * cx * cx - sx) * frequency * frequency;
+            weightSum += weight;
+            // The slope (weight times frequency) falls with the frequency, so the short waves do not outweigh the long
+            // ones and cross in a lattice.
+            weight *= 0.72;
+            frequency *= 1.18;
+            angle += 2.39996;                                       // the golden angle: no two waves line up
+        }
+        return sum / max(weightSum, 1e-4);
+    }
+
+    // Caustics: the bright net where light focused by the waves lands, drawn as where two cells of a moving Voronoi
+    // pattern meet (F2 - F1 near 0), two layers at another size and angle over each other.
+    float2 CausticHash(float2 c)
+    {
+        return frac(sin(float2(dot(c, float2(127.1, 311.7)), dot(c, float2(269.5, 183.3)))) * 43758.5453);
+    }
+
+    float CausticEdge(float2 p, float t)
+    {
+        const float2 cell = floor(p), f = frac(p);
+        float f1 = 9.0, f2 = 9.0;
+        [unroll] for (int y = -1; y <= 1; y++)
+        {
+            [unroll] for (int x = -1; x <= 1; x++)
+            {
+                const float2 o = float2(x, y);
+                const float2 h = CausticHash(cell + o);
+                const float d = length(o + 0.5 + 0.4 * sin(t * float2(1.0, 0.8) + 6.2831853 * h) - f);
+                f2 = d < f1 ? f1 : min(f2, d);
+                f1 = min(f1, d);
+            }
+        }
+        return f2 - f1;
+    }
+
+    // q in cells; 0 to about 1.7. The lines widen where a cell is under a pixel (far away), so they fade, not shimmer.
+    float Caustic(float2 q, float time)
+    {
+        const float2 r = float2(q.x * 0.8 - q.y * 0.6, q.x * 0.6 + q.y * 0.8) / 0.7 + float2(7.3, 3.1);
+        const float soft = max(1.0, (abs(ddx(q.x)) + abs(ddy(q.x)) + abs(ddx(q.y)) + abs(ddy(q.y))) * 6.0);
+        const float t = time * 0.6;
+        return (exp(-CausticEdge(q, t) * 9.0 / soft) + 0.7 * exp(-CausticEdge(r, t + 1.3) * 9.0 / soft)) / soft;
+    }
+
+    // The detail normal's slope at a world position (a frame of its flipbook blended into the next): read by the
+    // unwrapped coordinate's gradients, so the mip does not jump at the tile's edge.
+    float2 DetailSlope(float2 p, float time)
+    {
+        float s, c;
+        sincos(g_flDetailScrollDirection, s, c);
+        const float2 uv = p / g_flDetailNormalScale + float2(c, s) * g_flDetailScrollSpeed * time;
+        const float frames = max(round(g_flDetailFrames), 1.0);
+        const float columns = max(round(g_flDetailColumns), 1.0);
+        const float2 cell = 1.0 / float2(columns, ceil(frames / columns));
+        const float f = time * g_flDetailFrameRate;
+        const float f0 = fmod(floor(f), frames), f1 = fmod(f0 + 1.0, frames);
+        const float2 local = frac(uv) * cell;
+        const float2 gx = ddx(uv) * cell, gy = ddy(uv) * cell;
+        const float2 c0 = float2(fmod(f0, columns), floor(f0 / columns)) * cell;
+        const float2 c1 = float2(fmod(f1, columns), floor(f1 / columns)) * cell;
+        const float2 n0 = DecodeNormal(g_tDetailNormal.SampleGrad(g_sWrap, c0 + local, gx, gy).rg).xy;
+        const float2 n1 = DecodeNormal(g_tDetailNormal.SampleGrad(g_sWrap, c1 + local, gx, gy).rg).xy;
+        return lerp(n0, n1, frac(f)) * g_flDetailNormalStrength;
+    }
+
+    // The distance from the camera along a direction to where the scene's depth is at a pixel, by the projection the
+    // vertex stage uses (a depth of 1 or more, the sky, is far away).
+    // A pixel kept inside the engine's viewport: the target is larger than it in S2FM (the space under its bars,
+    // another camera's letterbox), and what lies outside is not this view's scene.
+    float2 InViewport(float2 pixel)
+    {
+        return clamp(pixel, g_vViewportOffset + 0.5, g_vViewportOffset + g_vViewportSize - 0.5);
+    }
+
+    float SceneDistance(float2 pixel, float3 camera, float3 direction)
+    {
+        const float stored = g_tSceneDepth.Load(int3(InViewport(pixel), 0)).r;
+        const float d = (stored - g_flViewportMinZ) / (g_flViewportMaxZ - g_flViewportMinZ);
+        const float4 c = mul(g_matWorldToProjectionMultiview[0], float4(camera, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        const float4 r = mul(g_matWorldToProjectionMultiview[0], float4(direction, 0.0));
+        const float t = (c.z - d * c.w) / (d * r.w - r.z);
+        // Nothing drawn there (the sky, at either end of the stored range) solves to no distance or a vast one.
+        return t > 0.0 && t < 1e6 ? t : 1e6;
+    }
+
+    float3 Copy(float2 pixel, float level = 0.0)
+    {
+        float2 size;
+        g_tFrameBufferCopyTexture.GetDimensions(size.x, size.y);
+        return g_tFrameBufferCopyTexture.SampleLevel(g_sFrameCopy, InViewport(pixel) / size, level).rgb;
+    }
+
+    // A world position on the screen: xy in -1..1 (y up), z the clip w (0 or less: behind the camera).
+    float3 ScreenNdc(float3 worldPosition)
+    {
+        const float4 clip = mul(g_matWorldToProjectionMultiview[0], float4(worldPosition, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        return float3(clip.xy / max(clip.w, 1e-4), clip.w);
+    }
+
+    // Screen space reflection: the reflected ray from p marched through the scene's depth in steps growing with the
+    // distance (the first one jittered per pixel, against bands), the crossing found by halving the last step, the
+    // point it hits read from the frame copy, blurrier for a rougher surface and a longer ray. Pixels are taken
+    // relative to this one's (pixel), so the viewport's place in the target does not matter. Returns how much the hit
+    // counts: nothing for a miss, fading at the screen's edge and for rays turned back toward the camera.
+    float ScreenReflection(float3 p, float3 r, float3 v, float2 pixel, float3 camera, float roughness, out float3 color)
+    {
+        color = 0.0;
+        const float toward = saturate(dot(r, v) * 4.0 + 1.0);
+        if (toward <= 0.0)
+            return 0.0;
+        const float3 origin = ScreenNdc(p);
+        const float2 toPixels = float2(0.5, -0.5) * g_vViewportSize;
+        const int count = (int)clamp(g_flSsrSteps, 4.0, 128.0);
+        const float grow = 1.06;
+        float stepLength = g_flSsrDistance * (grow - 1.0) / (pow(grow, (float)count) - 1.0);
+        float t = stepLength * frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+        [loop] for (int k = 0; k < count; k++)
+        {
+            t += stepLength;
+            const float3 q = p + r * t;
+            const float3 ndc = ScreenNdc(q);
+            if (ndc.z <= 0.0 || any(abs(ndc.xy) > 1.0))
+                return 0.0;
+            const float rayDistance = length(q - camera);
+            const float sceneDistance = SceneDistance(pixel + (ndc.xy - origin.xy) * toPixels, camera, (q - camera) / rayDistance);
+            if (rayDistance > sceneDistance)
+            {
+                // Behind something thicker than Thickness the ray goes on, it may come out behind it.
+                if (rayDistance - sceneDistance > g_flSsrThickness + stepLength)
+                {
+                    stepLength *= grow;
+                    continue;
+                }
+                // The crossing, between this step and the one before.
+                float a = t - stepLength, b = t;
+                [unroll] for (int h = 0; h < 5; h++)
+                {
+                    const float m = (a + b) * 0.5;
+                    const float3 mq = p + r * m;
+                    const float md = length(mq - camera);
+                    const float3 mn = ScreenNdc(mq);
+                    if (md > SceneDistance(pixel + (mn.xy - origin.xy) * toPixels, camera, (mq - camera) / md))
+                        b = m;
+                    else
+                        a = m;
+                }
+                const float3 hit = ScreenNdc(p + r * b);
+                const float2 edge = saturate((1.0 - abs(hit.xy)) / g_flSsrEdgeFade);
+                // The blur: the footprint of the reflection's spread (roughness squared) over the ray, in pixels.
+                const float radius = roughness * roughness * b / max(length(p + r * b - camera), 1.0) * g_vViewportSize.y * 0.5;
+                color = Copy(pixel + (hit.xy - origin.xy) * toPixels, log2(max(radius, 1.0)));
+                return edge.x * edge.y * toward;
+            }
+            stepLength *= grow;
+        }
+        return 0.0;
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+        discard;
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float3 p = WorldPosition(i.vPositionWs);
+        const float3 camera = g_vCameraPositionWs;
+        const float surfaceDistance = length(p - camera);
+        const float3 v = (p - camera) / max(surfaceDistance, 1e-4);   // from the camera
+        const float time = g_flTime;
+
+        // The waves' normal, on the mesh's own normal (a flat water plane).
+        PixelInput frame = i;
+    #if S_RENDER_BACKFACES
+        if (dot(i.vNormalWs.xyz, camera - p) < 0.0)
+            frame.vNormalWs.xyz = -i.vNormalWs.xyz;
+    #endif
+        const float3 up = normalize(frame.vNormalWs.xyz);
+        const float4 wave = Waves(p.xy, time);
+        // What touches the water (the mod pack's map): x the ripples' height, z the debris cleared, w foam.
+        float4 fx = 0.0;
+        float2 ripple = 0.0;
+        if (g_bInteraction)
+        {
+            const float2 fuv = p.xy / 2048.0;
+            const float texel = 1.0 / 1024.0;
+            fx = g_tWaterEffects.SampleLevel(g_sEffects, fuv, 0);
+            ripple = float2(g_tWaterEffects.SampleLevel(g_sEffects, fuv + float2(texel, 0.0), 0).x -
+                            g_tWaterEffects.SampleLevel(g_sEffects, fuv - float2(texel, 0.0), 0).x,
+                            g_tWaterEffects.SampleLevel(g_sEffects, fuv + float2(0.0, texel), 0).x -
+                            g_tWaterEffects.SampleLevel(g_sEffects, fuv - float2(0.0, texel), 0).x) * g_flRippleStrength;
+        }
+        const float2 detail = g_bDetailNormal ? DetailSlope(p.xy, time) : 0.0;
+        const float3 n = normalize(up - float3(wave.yz * g_flWaveNormalStrength * g_flWaveScale * 0.05 + ripple, 0.0) + float3(detail, 0.0));
+
+        // The water's depth here: along the view (the colour's path) and straight down (shore, foam, caustics).
+        const float floorDistance = SceneDistance(i.vPositionPs.xy, camera, v);
+        const float thickness = max(floorDistance - surfaceDistance, 0.0);
+        const float3 floorPoint = camera + v * floorDistance;
+        const float depth = max(dot(p - floorPoint, up), 0.0);
+
+        // Refraction: the floor read at a pixel moved by the waves' slope as seen on screen, more where it is deeper;
+        // a moved pixel whose scene is in front of the water (a pole standing in it) is not taken.
+        const float3 nView = mul((float3x3)g_matWorldToView, n - up);
+        const float2 shift = float2(nView.x, -nView.y) * g_flRefraction * g_vViewportSize.y * 0.05 * saturate(thickness / 20.0);
+        float2 at = i.vPositionPs.xy + shift;
+        // (By the distance along the view, whichever way the depth is stored; the moved pixel's ray is taken as this one's.)
+        if (SceneDistance(at, camera, v) < surfaceDistance)
+            at = i.vPositionPs.xy;
+        const float3 split = float3(1.0 + g_flRefractChromaticSeparation * 0.15, 1.0, 1.0 - g_flRefractChromaticSeparation * 0.15);
+        float3 below;
+        below.r = Copy(i.vPositionPs.xy + (at - i.vPositionPs.xy) * split.r).r;
+        below.g = Copy(at).g;
+        below.b = Copy(i.vPositionPs.xy + (at - i.vPositionPs.xy) * split.b).b;
+
+        // The surface as lit.vfx lights it: no diffuse of its own, the IOR's F0.
+        const float r0 = (g_flIor - 1.0) / (g_flIor + 1.0);
+        LightingSurface s = LitSurface(i, 0.0, n, g_flRoughness, 0.0, 1.0);
+        s.specularColor = r0 * r0;
+        SpecularEnergy(s);
+        const DirectLight direct = DirectLighting(s);
+        const float3 ambient = AmbientDiffuse(s);
+        const float3 light = SurfaceAmbient(s) + direct.diffuse;
+        float3 environment = AmbientSpecular(s, ambient);
+        if (g_bScreenSpaceReflections)
+        {
+            float3 seen;
+            const float weight = ScreenReflection(p, reflect(v, n), v, i.vPositionPs.xy, camera, g_flRoughness, seen);
+            if (weight > 0.0)
+            {
+                // Weighted by the same lobe's albedo as the environment map (ours, or Valve's split sum table).
+                float3 albedo;
+                if (g_bValveShading)
+                {
+                    float2 brdf = g_tBRDFLookup.SampleLevel(g_sLinearClamp, float2(max(dot(-v, n), 0.0), g_flRoughness), 0).xy;
+                    brdf *= brdf;
+                    albedo = s.specularColor * brdf.x + brdf.y;
+                }
+                else
+                {
+                    const float4 e = BrdfAlbedo(max(dot(-v, n), 0.0), g_flRoughness);
+                    albedo = s.specularColor * (e.x - e.y) + e.y;
+                }
+                environment = lerp(environment, seen * albedo, weight);
+            }
+        }
+        const float3 reflection = (direct.specular * s.directSpecularOcclusion + environment) * s.specularEnergy * g_flReflectance;
+
+        // Caustics on the floor: a moving net of focused light (cells of 80 units at a scale of 1), bent by the surface's
+        // slope over the depth as the light through it is; fading with depth. (Not the waves' own curvature: its short
+        // waves outweigh the rest and draw a lattice of straight lines.)
+        if (g_bCaustics && floorDistance < 1e5)
+        {
+            const float2 q = (floorPoint.xy + (n.xy - up.xy) * depth * 2.0) / max(g_flCausticScale * 80.0, 1.0);
+            const float caustic = pow(saturate(Caustic(q, time) * 0.6), g_flCausticSharpness * 0.25) * 2.0;
+            below *= 1.0 + caustic * g_flCausticsStrength * SrgbGammaToLinear(g_vCausticsTint) *
+                           exp(-depth / g_flCausticDepthFallOffDistance);
+        }
+
+        // Through the water: decay over the path, then the light scattered in it.
+        const float3 decay = pow(max(SrgbGammaToLinear(g_vWaterDecayColor), 1e-4), thickness / g_flWaterDecayDistance);
+        const float fog = 1.0 - exp(-thickness / g_flWaterFogDistance);
+        float3 water = lerp(below * decay, SrgbGammaToLinear(g_vWaterFogColor) * light, fog);
+        // What of the colour is the scene behind as the frame copy has it (its fog in it already), and how much of it:
+        // followed through every blend below, so that only the rest is fogged at the end.
+        float3 passing = below * decay * (1.0 - fog);
+        float3 share = decay * (1.0 - fog);
+
+        // Foam where it is shallow, broken up by the wave crests and the foam texture.
+        // Foam, at the shore and where something moves (the mod pack's map, smoothed over its texels so they do not show).
+        float density = 0.0;
+        if (g_bFoam && g_flFoamDistance > 0.0)
+        {
+            const float shallow = 1.0 - saturate(depth / g_flFoamDistance);
+            density = shallow * shallow * saturate(wave.x * 1.5 + 0.4);
+        }
+        if (fx.w > 0.0)
+        {
+            const float2 fuv = p.xy / 2048.0;
+            const float r = 1.5 / 1024.0;
+            density = max(density, (fx.w + g_tWaterEffects.SampleLevel(g_sEffects, fuv + float2(r, 0.0), 0).w +
+                                    g_tWaterEffects.SampleLevel(g_sEffects, fuv - float2(r, 0.0), 0).w +
+                                    g_tWaterEffects.SampleLevel(g_sEffects, fuv + float2(0.0, r), 0).w +
+                                    g_tWaterEffects.SampleLevel(g_sEffects, fuv - float2(0.0, r), 0).w) * 0.2 * g_flInteractionFoam);
+        }
+        if (density > 0.0)
+        {
+            // Two layers of the texture, the second turned and smaller, drifting apart slowly and bent with the waves.
+            const float2 bend = (wave.yz * g_flWaveScale * 0.1 + ripple * 2.0) * g_flFoamWobble;
+            const float2 uvA = (p.xy + bend) / g_flFoamScale + float2(0.011, 0.004) * time;
+            const float2 uvB = mul(float2x2(0.8, -0.6, 0.6, 0.8), p.xy + bend * 1.3) / (g_flFoamScale * 0.7) - float2(0.006, 0.009) * time;
+            const float height = g_tFoam.Sample(g_sWrap, uvA).r * 0.6 + g_tFoam.Sample(g_sWrap, uvB).r * 0.4;
+            // Thinning out from the thin parts: what is left is the texture above (1 - density).
+            const float cover = saturate((height - (1.0 - saturate(density))) * g_flFoamSharpness);
+            if (cover > 0.0)
+            {
+                const float2 tilt = DecodeNormal(g_tFoamNormal.Sample(g_sWrap, uvA).rg).xy * 0.6 +
+                                    DecodeNormal(g_tFoamNormal.Sample(g_sWrap, uvB).rg).xy * 0.4;
+                const float3 foamNormal = normalize(n + float3(tilt, 0.0));
+                LightingSurface fs = LitSurface(i, SrgbGammaToLinear(g_vFoamColor), foamNormal, 0.55, 0.0, 1.0);
+                // Thicker foam is brighter, its thin film darker with the water under it.
+                const float3 foamLit = ShadeSurface(fs) * (0.55 + 0.45 * height);
+                water = lerp(water, foamLit, cover * 0.95);
+                passing *= 1.0 - cover * 0.95;
+                share *= 1.0 - cover * 0.95;
+            }
+        }
+
+        const float nDotV = max(dot(n, -v), 1e-3);
+        const float fresnel = s.specularColor.x + (1.0 - s.specularColor.x) * pow(1.0 - nDotV, 5.0);
+        float3 result = water * (1.0 - fresnel) + reflection;
+        passing *= 1.0 - fresnel;
+        share *= 1.0 - fresnel;
+
+        // Debris on top: where its height clears the amount, lit as its own rough surface, a little of the water's
+        // reflection showing through.
+        if (g_bDebris)
+        {
+            float ds, dc;
+            sincos(g_flDebrisDriftDirection, ds, dc);
+            const float2 drift = float2(dc, ds) * g_flDebrisDriftSpeed * time;
+            // The churn: a slow, large swirl of the texture coordinates that never repeats along one line.
+            const float2 q = (p.xy + drift) / g_flDebrisScale;
+            const float2 churn = float2(sin(q.y * 2.1 + time * 0.13), sin(q.x * 1.7 - time * 0.11)) * 0.04;
+            const float2 debrisUv = q + churn + wave.yz * g_flDebrisWobble * g_flWaveScale * 0.02;
+            const float height = g_tDebrisHeight.Sample(g_sWrap, debrisUv).r;
+            // A soft edge: the cover eases in and out rather than stopping at a line.
+            const float cover = smoothstep(0.0, 1.0, saturate((height - (1.0 - g_flDebrisAmount * (1.0 - fx.z * g_flDebrisClearing))) *
+                                                              g_flDebrisEdgeSharpness));
+            if (cover > 0.0)
+            {
+                const float3 dn = DecodeNormal(g_tDebrisNormal.Sample(g_sWrap, debrisUv).rg);
+                const float3 debrisNormal = normalize(up * dn.z + float3(dn.xy * g_flDebrisNormalStrength - wave.yz * g_flWaveScale * 0.05, 0.0));
+                const float3 albedo = g_tDebris.Sample(g_sWrap, debrisUv).rgb * SrgbGammaToLinear(g_vDebrisTint);
+                LightingSurface ds = LitSurface(i, albedo, debrisNormal, lerp(0.9, g_flRoughness, g_flDebrisOiliness), 0.0, 1.0);
+                const float3 debris = ShadeSurface(ds) + reflection * g_flDebrisReflectance;
+                result = lerp(result, debris, cover);
+                passing *= 1.0 - cover;
+                share *= 1.0 - cover;
+            }
+        }
+        // The shore: the water fades into the floor over Shore Softness of depth.
+        if (g_flShoreSoftness > 0.0)
+        {
+            const float t = saturate(depth / g_flShoreSoftness);
+            const float3 floorSeen = Copy(i.vPositionPs.xy);
+            result = lerp(floorSeen, result, t);
+            passing = lerp(floorSeen, passing, t);
+            share = lerp(1.0, share, t);
+        }
+        // Only the water's own light is fogged: the floor seen through it, and at the shore, has its fog already.
+        result = ApplyFogSeeThrough(result - passing, passing, 1.0 - dot(share, float3(0.2126, 0.7152, 0.0722)),
+                                    i.vPositionWs, i.vPositionPs.xy);
+        return float4(result, 1.0);
+    }
+#endif
+}

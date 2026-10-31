@@ -1,0 +1,1253 @@
+// Weather: clouds, rain, snow, sleet, hail, smoke, fog banks and nebulae filling a model, written from scratch for this
+// project. The model is only the carrier (S2FM's dev sphere, models/dev/sphere): the volume is a shape of its own
+// inside it, an ellipsoid or a box, and the pixel shader marches the view ray through that shape, sampling a density
+// built from two baked, tileable 3D noises (tests/weather_noise.py), lighting each step and blending the result over
+// the scene.
+//   Shape          Ellipsoid (single clouds, puffs) or Box (layers: a weather map spreads clouds over the box)
+//   Clouds         coverage, density, type (cumulus, stratus, cumulonimbus, cirrus), size, detail, wispy edges
+//   Motion         wind, evolution, seed (or a seed from the model's position)
+//   Light          the sun and S2FM's lights with their shadows, the probe's sky light, the cloud's own shadow toward
+//                  the key light, silver lining, powder, multiple scattering; Emission and Lightning as features
+//   Precipitation  rain, snow, sleet or hail from under a layer's clouds (s2vfx/precipitation.hlsl): particles near
+//                  the camera, lit curtains farther, falling until they meet the scene
+//   Haze           that curtain on its own: density, brightness, glow toward the lights, colour, refraction, and how
+//                  near and how far it reaches
+// Time is the engine's (g_flTime), which follows S2FM's timeline: a render gives the same picture for the same frame.
+// The clouds turn with the model; the rain falls down in the world whichever way the model is turned (from a layer
+// turned upside down, from its band's lower edge in the world). The camera may stand inside the volume (in the rain
+// under a layer, say): both faces are drawn, the far one only from inside.
+
+HEADER
+{
+    Description = "Weather: lit, animated clouds, rain, snow, smoke, fog and nebulae filling a model";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    // Every choice only changes what the code reads (UiOnly below): one variant for all of them.
+    Feature(F_SHAPE, 0..1 (0="Ellipsoid", 1="Box"), "Volume");
+    Feature(F_CLOUD_TYPE, 0..3 (0="Cumulus", 1="Stratus", 2="Cumulonimbus", 3="Cirrus"), "Volume");
+    Feature(F_EMISSION, 0..1, "Volume");
+    Feature(F_LIGHTNING, 0..1, "Volume");
+    Feature(F_RAIN, 0..4 (0="None", 1="Rain", 2="Snow", 3="Sleet", 4="Hail"), "Volume");
+    Feature(F_SHADOW_ONLY, 0..1, "Volume");
+    // Surfaces: the precipitation on the scene's surfaces (splashes, ripples, wetness, puddles, snow cover), a
+    // variant of its own (s2vfx/weather_ground.hlsl).
+    Feature(F_SURFACES, 0..1, "Volume");
+}
+
+COMMON
+{
+    // The vertex stage reshapes the carrier (Displace) and hands the pixel stage its radius and the object's matrix.
+    #define S2VFX_DISPLACE 1
+    #define S2VFX_OBJECT_MATRIX 1
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    StaticCombo(S_SHAPE, F_SHAPE, Sys(ALL), UiOnly(g_flShape));
+    StaticCombo(S_RAIN, F_RAIN, Sys(ALL), UiOnly(g_flRainOn));
+
+    float g_flShape < Default(0.0); >;
+    float g_flRainOn < Default(0.0); >;
+    // Shape Size: the shape's half extents as shares of the carrier's radius (x, y, z). At most 1: the engine culls
+    // the model by its own bounds, so a bigger volume is made by scaling the model.
+    float3 g_vShapeSize < UiType(VectorText); Default3(1.0, 1.0, 1.0); Range3(0.05, 0.05, 0.05, 1.0, 1.0, 1.0); UiGroup("Shape,10/10"); >;
+    // Rain Length (Box): how far below the box the precipitation can fall, world units. It stops sooner where it meets the
+    // scene. The rain is drawn only where the carrier is seen, so it reaches the ground on the dev sphere (stretched
+    // down this far) and not on a flat model. Past the model's bounds the engine may cull it with the model.
+    float g_flRainLength < UiType(Slider); Default(20000.0); Range(0.0, 200000.0); UiGroup("Precipitation,80/170"); UiFeature(F_RAIN); >;
+
+    // The carrier's vertices onto the shape: a sphere about the origin, its radius the vertex's distance. The box
+    // takes them onto the cube round the sphere (no box model needed); the ellipsoid pushes them past the chords
+    // between them, so the mesh covers the shape. A box with rain is stretched down (the world's down) by the Rain
+    // Length. extra: xyz the shape's half extents, w how far below them the rain reaches (object units).
+    void Displace(inout float3 position, inout float3 normal, float3x4 m, out float4 extra)
+    {
+        const float radius = length(position);
+        const float3 extent = radius * g_vShapeSize;
+        const float3 zAxis = float3(m[0].z, m[1].z, m[2].z);
+        const float below = g_flShape > 0.5 && g_flRainOn > 0.5 ? g_flRainLength / max(length(zAxis), 1e-4) : 0.0;
+        extra = float4(extent, below);
+        if (radius < 1e-4)
+            return;
+        float3 d = position / radius;
+        if (g_flShape > 0.5)
+            d /= max(max(abs(d.x), abs(d.y)), abs(d.z));
+        else
+            d *= 1.02;
+        position = d * extent;
+        // The world's lower half (the object's z may point down) down to the rain's end.
+        if (d.z * zAxis.z < 0.0)
+            position.z += d.z * below;
+        normal = normalize(d / g_vShapeSize);
+    }
+
+    #include "s2vfx/vertex.hlsl"
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_SHAPE, F_SHAPE, Sys(ALL), UiOnly(g_flShape));
+    StaticCombo(S_CLOUD_TYPE, F_CLOUD_TYPE, Sys(ALL), UiOnly(g_flCloudType));
+    StaticCombo(S_EMISSION, F_EMISSION, Sys(ALL), UiOnly(g_flEmissionOn));
+    StaticCombo(S_LIGHTNING, F_LIGHTNING, Sys(ALL), UiOnly(g_flLightningOn));
+    StaticCombo(S_RAIN, F_RAIN, Sys(ALL), UiOnly(g_flRainOn));
+    // A real variant: it changes how the engine sorts the material.
+    StaticCombo(S_SHADOW_ONLY, F_SHADOW_ONLY, Sys(ALL));
+    // A real variant too: the surfaces' code costs compile time, so a material without them does not carry it.
+    StaticCombo(S_SURFACES, F_SURFACES, Sys(ALL));
+
+    // Among the see-through surfaces, kept out of the depth prepass, blended with premultiplied alpha: the colour is
+    // the light the volume sends to the eye, the alpha how much of the scene behind it hides. Both faces, no depth
+    // test: from inside the volume only its far faces are seen, and they may lie behind the scene (the rain column
+    // under the ground); the march stops at the scene's depth itself. The engine draws no see-through material into
+    // its shadow maps, so Shadow Only is the volume's shadow on its own: an opaque material (the shadow maps take it)
+    // that draws nothing on screen, for a copy of the cloud's model beside the cloud.
+    BoolAttribute(translucent, S_SHADOW_ONLY ? false : true);
+    BoolAttribute(NoZPrepass, true);
+    RenderState(BlendEnable, S_SHADOW_ONLY ? false : true);
+    RenderState(SrcBlend, S_SHADOW_ONLY ? DEFAULT : ONE);
+    RenderState(DstBlend, S_SHADOW_ONLY ? DEFAULT : INV_SRC_ALPHA);
+    RenderState(DepthWriteEnable, S_SHADOW_ONLY ? DEFAULT : false);
+    RenderState(DepthEnable, S_SHADOW_ONLY ? DEFAULT : false);
+    RenderState(CullMode, S_SHADOW_ONLY ? DEFAULT : NONE);
+
+    #define S2VFX_NO_DYNAMIC_AO 1
+    #include "s2vfx/lighting.hlsl"
+    #define S2VFX_FOG_LEVEL_ZERO 1    // the fog is applied after the march, inside flow control
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"    // SrgbGammaToLinear, for the colour parameters
+    #include "s2vfx/screen.hlsl"
+
+    float g_flShape < Default(0.0); >;
+    float g_flCloudType < Default(0.0); >;
+    float g_flEmissionOn < Default(0.0); >;
+    float g_flLightningOn < Default(0.0); >;
+    float g_flRainOn < Default(0.0); >;
+
+    // ------------------------------------------------------------------------------------------ shape
+    // Edge Fade: how far in from the shape's edge the volume thins out (a share of it), so the container never shows.
+    // Cloud Base and Cloud Top (Box): the height band, as shares of the box's height, the clouds fill.
+    float g_flEdgeFade < UiType(Slider); Default(0.3); Range(0.01, 1.0); UiGroup("Shape,10/20"); >;
+    float g_flCloudBase < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Shape,10/30"); >;
+    float g_flCloudTop < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Shape,10/40"); >;
+
+    // ------------------------------------------------------------------------------------------ clouds
+    // Coverage: how much of the shape is cloud (low: few small clouds, high: a closed sky). Density: how thick it is
+    // (1: a cloud about two of its own widths deep hides what is behind it). Cloud Size: how big each cloud is, as a
+    // share of the shape's smallest half extent. Detail Scale: how fine the edges' noise is; Wispiness: how much of
+    // the edges it eats.
+    float g_flCoverage < UiType(Slider); Default(0.55); Range(0.0, 1.0); UiGroup("Clouds,20/10"); >;
+    float g_flDensity < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Clouds,20/20"); >;
+    float g_flCloudSize < UiType(Slider); Default(1.0); Range(0.1, 8.0); UiGroup("Clouds,20/30"); >;
+    float g_flDetailScale < UiType(Slider); Default(3.0); Range(0.5, 16.0); UiGroup("Clouds,20/40"); >;
+    float g_flWispiness < UiType(Slider); Default(0.4); Range(0.0, 1.0); UiGroup("Clouds,20/50"); >;
+
+    // ------------------------------------------------------------------------------------------ motion
+    // Wind: the direction (the model's x and y) and speed (cloud widths a second) the field drifts at. Evolution: how
+    // fast the shapes change. Seed: which clouds (each a different sky); Seed By Position: the seed from where the
+    // model stands, so copies spread over a scene all differ.
+    float2 g_vCloudWind < UiType(VectorText); Default2(1.0, 0.0); Range2(-1.0, -1.0, 1.0, 1.0); UiGroup("Motion,30/10"); >;
+    float g_flCloudWindSpeed < UiType(Slider); Default(0.05); Range(0.0, 2.0); UiGroup("Motion,30/20"); >;
+    float g_flEvolution < UiType(Slider); Default(0.02); Range(0.0, 1.0); UiGroup("Motion,30/30"); >;
+    float g_flSeed < UiType(Slider); Default(0.0); Range(0.0, 1000.0); UiGroup("Motion,30/40"); >;
+    bool g_bSeedByPosition < UiType(CheckBox); Default(0); UiGroup("Motion,30/50"); >;
+
+    // ------------------------------------------------------------------------------------------ noise
+    // The baked noises (tests/weather_noise.py): shape (126^3, 16 slices a row) and detail (30^3, 8 a row).
+    CreateInputTexture2D(TextureShapeNoise, Linear, 8, "", "_noise", "Noise,95/10", Default4(0.5, 0.5, 0.5, 0.5));
+    Texture2D g_tShapeNoise < Channel(RGBA, Box(TextureShapeNoise), Linear); OutputFormat(RGBA8888); SrgbRead(false); >;
+    CreateInputTexture2D(TextureDetailNoise, Linear, 8, "", "_noise", "Noise,95/20", Default3(0.5, 0.5, 0.5));
+    Texture2D g_tDetailNoise < Channel(RGB, Box(TextureDetailNoise), Linear); OutputFormat(RGBA8888); SrgbRead(false); >;
+    SamplerState g_sVolumeNoise < Filter(MIN_MAG_MIP_LINEAR); AddressU(CLAMP); AddressV(CLAMP); >;
+    #include "s2vfx/weather_noise.hlsl"
+    #include "s2vfx/weather_sky.hlsl"
+
+    // ------------------------------------------------------------------------------------------ light
+    // Light Strength scales every light on the volume; Ambient Strength the probe's sky light, Ambient Color one of
+    // its own added; Absorption how much light the volume swallows instead of scattering (smoke high, clouds low).
+    float g_flLightStrength < UiType(Slider); Default(1.0); Range(0.0, 50.0); UiGroup("Light,40/10"); >;
+    float g_flAmbientStrength < UiType(Slider); Default(1.0); Range(0.0, 20.0); UiGroup("Light,40/20"); >;
+    float3 g_vAmbientColor < UiType(Color); Default3(0.0, 0.0, 0.0); UiGroup("Light,40/30"); >;
+    float g_flAbsorption < UiType(Slider); Default(0.05); Range(0.0, 1.0); UiGroup("Light,40/40"); >;
+    // Use S2FM Lights: every kind S2FM adds, the light list's (point, spot, orthographic) and the projected ones.
+    bool g_bUseSun < UiType(CheckBox); Default(1); UiGroup("Light,40/50"); >;
+    bool g_bUseSfmLights < UiType(CheckBox); Default(1); UiGroup("Light,40/60"); >;
+    // Cast Shadow: how dark the shadow the volume throws on what lies beyond it (0: none).
+    float g_flCastShadow < UiType(Slider); Default(1.0); Range(0.0, 4.0); UiGroup("Light,40/70"); >;
+
+    // ------------------------------------------------------------------------------------------ scattering
+    // Silver Lining: how strongly light goes on forward through the volume (the bright edge when the light is behind
+    // it). Back Scatter: the glow of the side facing the light. Powder: the darkened thin edges facing the light.
+    // Multi Scatter: light bouncing inside, so the inside is soft and bright rather than black.
+    float g_flSilverLining < UiType(Slider); Default(0.75); Range(0.0, 0.95); UiGroup("Scattering,50/10"); >;
+    float g_flBackScatter < UiType(Slider); Default(0.3); Range(0.0, 0.9); UiGroup("Scattering,50/20"); >;
+    float g_flPowder < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Scattering,50/30"); >;
+    float g_flMultiScatter < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Scattering,50/40"); >;
+
+    // ------------------------------------------------------------------------------------------ emission
+    // The volume's own light: the ramp read by how dense it is (left thin, right at Core and above), times the colour
+    // and the strength (HDR: above 1 blooms).
+    float3 g_vEmissionColor < UiType(Color); Default3(1.0, 0.45, 0.12); UiGroup("Emission,60/10"); UiFeature(F_EMISSION); >;
+    float g_flEmissionStrength < UiType(Slider); Default(4.0); Range(0.0, 100.0); UiGroup("Emission,60/20"); UiFeature(F_EMISSION); >;
+    float g_flEmissionCore < UiType(Slider); Default(0.5); Range(0.01, 1.0); UiGroup("Emission,60/30"); UiFeature(F_EMISSION); >;
+    CreateInputTexture2D(TextureEmissionRamp, Srgb, 8, "", "_ramp", "Emission,60/40", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tEmissionRamp < Channel(RGB, Box(TextureEmissionRamp), Srgb); OutputFormat(DXT1); SrgbRead(true); UiFeature(F_EMISSION); >;
+
+    // ------------------------------------------------------------------------------------------ lightning
+    // Flashes a second (on average, seeded: each volume on its own beat), their colour and strength.
+    float g_flLightningRate < UiType(Slider); Default(0.3); Range(0.0, 5.0); UiGroup("Lightning,70/10"); UiFeature(F_LIGHTNING); >;
+    float3 g_vLightningColor < UiType(Color); Default3(0.75, 0.8, 1.0); UiGroup("Lightning,70/20"); UiFeature(F_LIGHTNING); >;
+    float g_flLightningStrength < UiType(Slider); Default(40.0); Range(0.0, 500.0); UiGroup("Lightning,70/30"); UiFeature(F_LIGHTNING); >;
+
+    // ------------------------------------------------------------------------------------------ quality
+    // Quality: the steps through the volume (fewer: faster, grainier; S2FM's refinement smooths the grain in renders).
+    // Light Steps: the steps of each sample's look toward the key light (its shadow inside the volume).
+    float g_flQuality < UiType(Slider); Default(48.0); Range(8.0, 256.0); UiGroup("Quality,90/10"); >;
+    float g_flLightSteps < UiType(Slider); Default(6.0); Range(1.0, 16.0); UiGroup("Quality,90/20"); >;
+
+    // ------------------------------------------------------------------------------------------ math
+    float Remap(float v, float lo, float hi, float a, float b)
+    {
+        return a + (v - lo) * (b - a) / (hi - lo);
+    }
+
+    float3x3 Inverse(float3x3 a)
+    {
+        const float3 c0 = cross(a[1], a[2]), c1 = cross(a[2], a[0]), c2 = cross(a[0], a[1]);
+        return transpose(float3x3(c0, c1, c2)) / dot(a[0], c0);
+    }
+
+    // ------------------------------------------------------------------------------------------ the shape
+    // Where a ray enters and leaves the box from lo to hi: o and d in the unit shape's space, the distances in d's
+    // units. x > y: missed.
+    float2 BoxHits(float3 o, float3 d, float3 lo, float3 hi)
+    {
+        const float3 safe = abs(d) > 1e-8 ? d : 1e-8;
+        const float3 a = (lo - o) / safe, b = (hi - o) / safe;
+        const float3 n = min(a, b), f = max(a, b);
+        return float2(max(max(n.x, n.y), n.z), min(min(f.x, f.y), f.z));
+    }
+
+    // Where a ray enters and leaves the unit shape (the unit sphere, or the cube from -1 to 1).
+    float2 UnitShapeHits(float3 o, float3 d)
+    {
+        if (g_flShape > 0.5)
+            return BoxHits(o, d, -1.0, 1.0);
+        const float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1.0;
+        const float disc = b * b - a * c;
+        if (disc < 0.0)
+            return float2(1.0, 0.0);
+        const float s = sqrt(disc);
+        return float2((-b - s) / a, (-b + s) / a);
+    }
+
+    // What every step of a pixel shares.
+    struct Volume
+    {
+        float3x3 toObject;      // world vectors into the object's space
+        float3x3 toWorld;       // and back
+        float3 origin;          // the object's origin, world
+        float3 half;            // the shape's half extents, object units
+        // The rain in the fall's own z (the unit box's z times fallSign, which is -1 for a model upside down: up in
+        // the world): from rainTop (the band's lower edge in the world) to rainBelow past the box's bottom.
+        float fallSign;
+        float rainTop;
+        float rainBelow;
+        float rainSigma;        // the rain's extinction per world unit at a share of 1
+        float unit;             // a cloud's width, object units (noise space's unit)
+        float worldPerUnit;     // world units an object unit (the model's scale)
+        float worldUnit;        // a cloud's width, world units
+        float sigma;            // extinction per world unit at density 1
+        float3 seedOffset;
+        float2x2 seedTurn;
+        float2 wind;            // the wind's direction, object space
+        float3 drift;           // how far the wind has carried the field, noise space
+        float evolve;           // how far the shapes have changed
+        float seed;
+    };
+
+    Volume VolumeFor(PixelInput i, float time)
+    {
+        Volume v;
+        const float3x4 m = float3x4(i.vObjectRow0, i.vObjectRow1, i.vObjectRow2);
+        v.toWorld = (float3x3)m;
+        v.toObject = Inverse(v.toWorld);
+        v.origin = float3(m[0].w, m[1].w, m[2].w);
+        v.half = i.vExtra.xyz;
+        v.rainBelow = i.vExtra.w / max(v.half.z, 1e-4);
+        v.fallSign = m[2].z < 0.0 ? -1.0 : 1.0;
+        v.rainTop = v.fallSign > 0.0 ? g_flCloudBase * 2.0 - 1.0 : 1.0 - g_flCloudTop * 2.0;
+        v.worldPerUnit = pow(abs(determinant((float3x3)m)), 1.0 / 3.0);
+        // The curtain's thickness per world unit at a share of 1 (Amount and Haze Density 1): about 3000 units (75 m)
+        // of it hides what is behind.
+        v.rainSigma = 1.0 / 3000.0;
+        v.unit = min(v.half.x, min(v.half.y, v.half.z)) * g_flCloudSize;
+        v.worldUnit = v.unit * v.worldPerUnit;
+        v.sigma = g_flDensity * 4.0 / max(v.worldUnit, 1e-3);
+        v.seed = g_flSeed + (g_bSeedByPosition ? dot(v.origin, float3(0.0137, 0.0191, 0.0233)) * 100.0 : 0.0);
+        v.seedOffset = Hash33(float3(v.seed, v.seed * 1.71, 3.1)) * 64.0;
+        float sn, cs;
+        sincos(Hash13(float3(v.seed, 0.5, 7.7)) * 6.2831853, sn, cs);
+        v.seedTurn = float2x2(cs, -sn, sn, cs);
+        v.wind = g_vCloudWind / max(length(g_vCloudWind), 1e-4);
+        v.drift = float3(v.wind * g_flCloudWindSpeed * time, 0.0);
+        v.evolve = time * g_flEvolution;
+        return v;
+    }
+
+    // A point of the unit shape in noise space (cloud widths): the wind's drift taken off in the model's axes, then
+    // turned and moved by the seed. Cirrus is squeezed along the wind, so its clouds streak along it.
+    float3 NoiseSpace(Volume v, float3 u)
+    {
+        float3 q = u * v.half / v.unit - v.drift;
+        if (g_flCloudType > 2.5)
+            q.xy -= v.wind * dot(q.xy, v.wind) * 0.75;
+        q.xy = mul(v.seedTurn, q.xy);
+        return q + v.seedOffset;
+    }
+
+    // Box layers: how covered the sky is over q.xy, from a slow slice of the shape noise: graded, up to a little over
+    // the Coverage where the map is high and none where it is low, so the billows only rise into clouds at their
+    // peaks (a coverage of 1 everywhere would be one closed sheet).
+    float WeatherAt(Volume v, float3 q)
+    {
+        const float map = ShapeNoise(float3(q.xy * 0.15, 0.37 + v.evolve * 0.2)).r;
+        return saturate(g_flCoverage * 1.3 * smoothstep(0.25, 0.75, map));
+    }
+
+    // How much cloud a type allows at height h (0..1 in its band), and how far it widens there (the anvil).
+    float2 TypeProfile(float h)
+    {
+        const int type = (int)(g_flCloudType + 0.5);
+        if (type == 1)          // stratus: a thin, flat sheet
+            return float2(saturate(Remap(h, 0.0, 0.15, 0.0, 1.0)) * saturate(Remap(h, 0.35, 0.6, 1.0, 0.0)), 0.0);
+        if (type == 2)          // cumulonimbus: tall, its top spreading into an anvil
+            return float2(saturate(Remap(h, 0.0, 0.05, 0.0, 1.0)) * saturate(Remap(h, 0.85, 1.0, 1.0, 0.0)),
+                          smoothstep(0.65, 0.9, h) * 0.6);
+        if (type == 3)          // cirrus: high and thin
+            return float2(saturate(Remap(h, 0.6, 0.75, 0.0, 1.0)) * saturate(Remap(h, 0.85, 1.0, 1.0, 0.0)), 0.0);
+        // cumulus: a flat base, rounding off toward the top
+        return float2(saturate(Remap(h, 0.0, 0.07, 0.0, 1.0)) * saturate(Remap(h, 0.2, 1.0, 1.0, 0.0)), 0.0);
+    }
+
+    // A single cloud's height profile by type (h 0..1 over the ellipsoid): cumulus a flat base, stratus a flat lens,
+    // cumulonimbus tall on a flat base, cirrus a thin sheet.
+    float PuffProfile(float h)
+    {
+        const int type = (int)(g_flCloudType + 0.5);
+        if (type == 1)
+            return smoothstep(0.3, 0.4, h) * (1.0 - smoothstep(0.6, 0.7, h));
+        if (type == 2)
+            return smoothstep(0.05, 0.15, h);
+        if (type == 3)
+            return smoothstep(0.42, 0.48, h) * (1.0 - smoothstep(0.52, 0.58, h));
+        return smoothstep(0.15, 0.3, h);
+    }
+
+    // The volume's share (0..1) at a point u of the unit shape, h its height in the band. Billows from the shape
+    // noise cut by the coverage and the type's profile; detailed: the edges eaten by the detail noise (wispy above,
+    // billowing below). The light's march takes the cheaper undetailed field. In a layer the weather map gives the
+    // coverage and the box's sides fade it; a single cloud takes its coverage from the ellipsoid itself, full in the
+    // middle and none at the edge, so the noise cuts its outline into billows.
+    float CloudAt(Volume v, float3 u, bool detailed, out float h)
+    {
+        const float z01 = u.z * 0.5 + 0.5;
+        float edge;
+        if (g_flShape > 0.5)
+        {
+            h = (z01 - g_flCloudBase) / max(g_flCloudTop - g_flCloudBase, 1e-3);
+            const float2 side = 1.0 - abs(u.xy);
+            edge = saturate(min(side.x, side.y) / g_flEdgeFade);
+            if (h < 0.0 || h > 1.0)
+                return 0.0;
+        }
+        else
+        {
+            h = z01;
+            edge = saturate((1.0 - length(u)) / g_flEdgeFade);
+        }
+        if (edge <= 0.0)
+            return 0.0;
+        const float3 q = NoiseSpace(v, u);
+        float cover;
+        float2 profile;
+        if (g_flShape > 0.5)
+        {
+            cover = WeatherAt(v, q);
+            if (cover <= 0.0)
+                return 0.0;
+            profile = TypeProfile(h);
+            cover = saturate(cover + profile.y);
+        }
+        else
+        {
+            // Coverage in the middle (the billows rise above the rest there), none at the edge.
+            cover = saturate(g_flCoverage * (0.5 + edge));
+            profile = float2(PuffProfile(h), 0.0);
+            edge = edge * (2.0 - edge);
+        }
+        const float4 s = ShapeNoise(q * 0.8 + float3(0.3, -0.2, 1.0) * v.evolve);
+        // The billows: the big Perlin-Worley shape made lumpy by the cells, shaped by the type's profile. Where it
+        // rises above the coverage's line it is cloud, its surface a quarter of the noise's range deep: where the
+        // coverage is high all of it, where it is low only the billows' tops.
+        const float cells = s.g * 0.5 + s.b * 0.3 + s.a * 0.2;
+        const float shape = (s.r * 0.65 + cells * 0.35) * profile.x;
+        const float cut = 1.0 - cover;
+        const float base = saturate((shape - cut) * 4.0) * edge;
+        if (!detailed || base <= 0.0)
+            return base;
+        // The edges eaten by the detail noise: wispy above, billowing below.
+        const float3 dn = DetailNoise(q * g_flDetailScale * 0.5 + float3(0.0, 0.0, -v.evolve * 3.0));
+        const float fine = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
+        const float detail = lerp(fine, 1.0 - fine, saturate(h * 5.0));
+        return saturate((shape - cut - detail * g_flWispiness * 0.3) * 4.0) * edge;
+    }
+
+    float Hg(float c, float g)
+    {
+        const float g2 = g * g;
+        return (1.0 - g2) / (12.5663706 * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+    }
+
+    // How much light turning by an angle (c its cosine: 1 going straight on) the volume sends on: a forward lobe and
+    // a weaker backward one; spread below 1 widens both (the later bounces of the multiple scattering).
+    float Phase(float c, float spread)
+    {
+        return lerp(Hg(c, g_flSilverLining * spread), Hg(c, -g_flBackScatter * spread), 0.3);
+    }
+
+    // A key names a light: -1 the sun, 0 to 31 a projected light, kListKey + n light list light n, -2 none.
+    static const int kListKey = 32;
+
+    // How much of each S2FM light the volume takes (its clouds, haze and falling particles; the wet ground's
+    // highlights are a surface's and take it whole): a projected light its volumetricIntensity with volumetric on, 0
+    // off; a point, spot or orthographic light its fogContributionStrength. The mod pack fills g_tLightFog, two
+    // rows: row 0 texel 0 the count, then each projected light's world position (xyz) and weight (w), found here by
+    // its position; row 1 the weight of each light of the engine's light list this draw has (x, by its index; it
+    // matched them to S2FM's lights itself), with 1 in texel 0's y when the row is there. A light not found (a map's
+    // own light, or no table) counts whole.
+    // (g_tLightFog itself is declared in lighting.hlsl, which every lit shader reads its lights' sizes from too.)
+    static float s_fogProjected[8];
+    static bool s_fogListed;
+
+    // The weight of the projected light at world position p: the nearest of the table's within 64 units, else 1.
+    float FogWeightAt(float3 p, int count)
+    {
+        float nearest = 64.0 * 64.0, weight = 1.0;
+        [loop] for (int k = 1; k <= count; k++)
+        {
+            const float4 e = g_tLightFog.Load(int3(k, 0, 0));
+            const float3 d = e.xyz - p;
+            if (dot(d, d) < nearest)
+            {
+                nearest = dot(d, d);
+                weight = e.w;
+            }
+        }
+        return weight;
+    }
+
+    // Every light's weight, once a pixel.
+    void FogWeights()
+    {
+        const int count = (int)clamp(g_tLightFog.Load(int3(0, 0, 0)).x, 0.0, 63.0);
+        const int projected = g_bIsSFM ? (int)g_SFMLight_Count : 0;
+        // Branches, not ?: (which works out both sides): only the lights there are look in the table.
+        [loop] for (int n = 0; n < 8; n++)
+        {
+            s_fogProjected[n] = 1.0;
+            if (n < projected)
+                s_fogProjected[n] = FogWeightAt(g_SFMLight_Position_Roundness[n].xyz, count);
+        }
+        s_fogListed = g_tLightFog.Load(int3(0, 1, 0)).y > 0.5;
+    }
+
+    // A key's weight (the sun's whole).
+    float LightFog(int key)
+    {
+        if (key >= kListKey)
+            return s_fogListed ? g_tLightFog.Load(int3(key - kListKey, 1, 0)).x : 1.0;
+        return key >= 0 && key < 8 ? s_fogProjected[key] : 1.0;
+    }
+
+    // An S2FM light by its key (0 and above): a projected light, or a light list light.
+    float3 S2fmLightAt(int key, float3 p, out float3 l)
+    {
+        if (key >= kListKey)
+            return ListLightAt(key - kListKey, p, l);
+        return SfmLightAt(key, p, l);
+    }
+
+    float3 LightAt(int key, float3 p, out float3 l)
+    {
+        l = float3(0.0, 0.0, 1.0);
+        if (key == -1)
+        {
+            l = g_vSunLightDir;
+            return SunLightAt(p);
+        }
+        if (key >= 0)
+            return S2fmLightAt(key, p, l);
+        return 0.0;
+    }
+
+    // The light whose shadow the volume marches: the brightest at the centre of the sun and S2FM's lights.
+    int ChooseKey(float3 centre)
+    {
+        int key = -2;
+        float best = 0.0;
+        if (g_bUseSun && g_nSunShadowCascadeCount > 0)
+        {
+            key = -1;
+            best = dot(g_vSunLightColor.xyz, float3(0.2126, 0.7152, 0.0722));
+        }
+        if (g_bUseSfmLights)
+        {
+            const int projected = g_bIsSFM ? (int)g_SFMLight_Count : 0;
+            const int count = projected + g_vNumLights.x;
+            for (int n = 0; n < count; n++)
+            {
+                const int candidate = n < projected ? n : kListKey + n - projected;
+                float3 l;
+                const float y = dot(LightAt(candidate, centre, l), float3(0.2126, 0.7152, 0.0722)) * LightFog(candidate);
+                if (y > best)
+                {
+                    best = y;
+                    key = candidate;
+                }
+            }
+        }
+        return key;
+    }
+
+    // How much volume lies between a point and the key light (the share times world units): Light Steps that grow
+    // with distance, out to where the way toward the light leaves the shape, at most three cloud widths.
+    float LightDepth(Volume v, float3 u, float3 l)
+    {
+        const float3 lu = mul(v.toObject, l) / v.half;
+        const float reach = min(UnitShapeHits(u, lu).y, v.worldUnit * 3.0);
+        if (reach <= 0.0)
+            return 0.0;
+        const int n = (int)clamp(g_flLightSteps, 1.0, 16.0);
+        const float total = n * (n + 1.0) * 0.5;
+        float depth = 0.0, t = 0.0;
+        [loop] for (int k = 0; k < n; k++)
+        {
+            const float ds = reach * (k + 1.0) / total;
+            float h;
+            depth += CloudAt(v, u + lu * (t + ds * 0.5), false, h) * ds;
+            t += ds;
+        }
+        return depth;
+    }
+
+    // The light a point sends toward the eye per unit of scattering: the key light through the volume toward it
+    // (three octaves of multiple scattering), the other lights through an estimate of the volume round the point,
+    // the sky (the probe above at the top, below at the bottom).
+    float3 InScatter(Volume v, int key, float3 u, float3 p, float3 dir, float h, float c, float4 flash)
+    {
+        float3 total = 0.0;
+        float3 l;
+        const float3 keyLight = LightAt(key, p, l) * g_flLightStrength * LightFog(key);
+        if (any(keyLight > 0.0))
+        {
+            const float depth = LightDepth(v, u, l) * v.sigma;
+            const float turn = dot(l, dir);
+            float a = 1.0, b = 1.0, spread = 1.0, sum = 0.0;
+            [unroll] for (int n = 0; n < 3; n++)
+            {
+                sum += b * Phase(turn, spread) * exp(-depth * a);
+                a *= 0.5;
+                b *= g_flMultiScatter * 0.7;
+                spread *= 0.5;
+            }
+            const float powder = lerp(1.0, 1.0 - exp(-c * v.sigma * v.worldUnit * 4.0), g_flPowder);
+            total += keyLight * sum * powder;
+        }
+        const float around = exp(-c * v.sigma * v.worldUnit * 0.5);
+        if (g_bUseSun && key != -1)
+            total += SunLightAt(p) * Phase(dot(g_vSunLightDir, dir), 1.0) * around * g_flLightStrength;
+        if (g_bUseSfmLights)
+        {
+            const int projected = g_bIsSFM ? (int)g_SFMLight_Count : 0;
+            const int count = projected + g_vNumLights.x;
+            for (int n = 0; n < count; n++)
+            {
+                const int other = n < projected ? n : kListKey + n - projected;
+                if (other == key)
+                    continue;
+                float3 ln;
+                const float3 light = LightAt(other, p, ln);
+                total += light * Phase(dot(ln, dir), 1.0) * around * g_flLightStrength * LightFog(other);
+            }
+        }
+        // The sky as radiance (the probe gives irradiance), dimmer toward the bottom where it comes in through the cloud.
+        const float3 sky = lerp(AmbientAt(p, float3(0.0, 0.0, -1.0)), AmbientAt(p, float3(0.0, 0.0, 1.0)), h);
+        total += (sky * g_flAmbientStrength + SrgbGammaToLinear(g_vAmbientColor) + g_vToolsAmbientLightingVr.xyz) *
+                 (0.31830989 * lerp(0.5, 1.0, h));
+        if (flash.w > 0.0)
+        {
+            const float far = length(u - flash.xyz);
+            total += SrgbGammaToLinear(g_vLightningColor) * g_flLightningStrength * flash.w * exp(-far * 3.0) *
+                     exp(-c * v.sigma * v.worldUnit * far);
+        }
+        return total;
+    }
+
+    // The lightning now: where in the unit shape (low in it) and how bright (0 between flashes). Time is cut into
+    // slots a flash long on average; in two thirds of them a flash comes at a seeded moment, flickering out over a
+    // third of a second.
+    float4 LightningNow(float time, float seed)
+    {
+        if (g_flLightningOn < 0.5 || g_flLightningRate <= 0.0)
+            return 0.0;
+        const float slot = floor(time * g_flLightningRate);
+        const float3 r = Hash33(float3(slot, seed, 17.0));
+        const float age = time - (slot + r.x * 0.7) / g_flLightningRate;
+        if (age < 0.0 || age > 0.35 || r.y < 0.33)
+            return 0.0;
+        const float flicker = (1.0 - age / 0.35) * (0.6 + 0.4 * sin(age * 90.0 + r.z * 6.2831853));
+        const float3 where = (Hash33(float3(slot, seed, 5.0)) * 2.0 - 1.0) * float3(0.6, 0.6, 0.3) - float3(0.0, 0.0, 0.3);
+        return float4(where, saturate(flicker));
+    }
+
+    // The volume's own light at a share c of it.
+    float3 EmissionAt(float c)
+    {
+        if (g_flEmissionOn < 0.5)
+            return 0.0;
+        const float along = saturate(c / g_flEmissionCore);
+        return SrgbGammaToLinear(g_vEmissionColor) * g_flEmissionStrength * along *
+               g_tEmissionRamp.SampleLevel(g_sVolumeNoise, float2(along, 0.5), 0).rgb;
+    }
+
+    // ------------------------------------------------------------------------------------------ precipitation
+    // The precipitation (s2vfx/precipitation.hlsl) asks the clouds where it falls and how it is lit: the volume and the
+    // lightning of this pixel are kept here for it.
+    static Volume s_volume;
+    static float4 s_flash;      // the lightning now: xyz where (world), w how bright
+    static int s_sky;           // the sky light (SkyLight), -1 none
+
+    #if S_SURFACES
+    #define S2VFX_PRECIP_SPLASHES 1
+    #endif
+    #include "s2vfx/precipitation.hlsl"
+    #if S_SURFACES
+    #include "s2vfx/weather_ground.hlsl"
+    #endif
+
+    // How far sideways (unit box xy) the precipitation drifts for each unit of the unit box's z it falls: the wind
+    // across the kind's own fall.
+    float2 FallLean(Volume v)
+    {
+        const float slope = min(g_flWindLean * 360.0 / PrecipFallSpeed(), 3.0);
+        return v.wind * slope * v.half.z / v.half.xy;
+    }
+
+    // The share of particles kept at a world point: inside the box's footprint and under its band, the clouds where it
+    // fell from (upwind), the showers and gusts, the virga.
+    float PrecipCover(float3 world)
+    {
+        const Volume v = s_volume;
+        float3 u = mul(v.toObject, world - v.origin) / v.half;
+        if (any(abs(u.xy) > 1.0))
+            return 0.0;
+        const float w = u.z * v.fallSign;
+        if (w >= v.rainTop)
+            return 0.0;
+        u.xy -= FallLean(v) * (v.rainTop - w);
+        const float3 q = NoiseSpace(v, u);
+        const float fall = v.rainTop + 1.0 + v.rainBelow;
+        return WeatherAt(v, q) * PrecipShowers(q.xy, mul(v.seedTurn, v.wind), g_flTime) * PrecipVirga((v.rainTop - w) / fall) *
+               SkyOpen(s_sky, world);
+    }
+
+    // The light a particle (or a step of the curtain) at world sends on along dir: the sky, the sun (its shadow from one
+    // quick comparison: falling rain needs no soft shadow) and every S2FM
+    // light through a lobe of asymmetry g (an even lobe gives the light itself), the lightning near its flash (as the
+    // clouds take it: fading over a third of the shape, Light Strength not on it).
+    float3 PrecipLight(float3 world, float3 dir, float g)
+    {
+        float3 lights = 0.0;
+        if (g_bUseSun)
+            lights += SunLightQuick(world) * Hg(dot(g_vSunLightDir, dir), g) * 12.5663706;
+        if (g_bUseSfmLights)
+        {
+            const int projected = g_bIsSFM ? (int)g_SFMLight_Count : 0;
+            const int count = projected + g_vNumLights.x;
+            for (int n = 0; n < count; n++)
+            {
+                float3 l;
+                const float3 light = S2fmLightAt(n < projected ? n : kListKey + n - projected, world, l);
+                lights += light * Hg(dot(l, dir), g) * 12.5663706 * LightFog(n < projected ? n : kListKey + n - projected);
+            }
+        }
+        float3 flash = 0.0;
+        if (s_flash.w > 0.0)
+        {
+            const float far = length(mul(s_volume.toObject, world - s_flash.xyz) / s_volume.half);
+            flash = SrgbGammaToLinear(g_vLightningColor) * g_flLightningStrength * s_flash.w * exp(-far * 3.0);
+        }
+        const float3 sky = AmbientAt(world, float3(0.0, 0.0, 1.0)) * g_flAmbientStrength + SrgbGammaToLinear(g_vAmbientColor) +
+                           g_vToolsAmbientLightingVr.xyz;
+        return lights * g_flLightStrength + flash + sky;
+    }
+
+    #if S_SURFACES
+    // The light reaching a ground point p with normal n seen from v (weather_ground.hlsl): the diffuse return of the sun
+    // and every S2FM light (Valve's scale: no 1/pi), and in specular their GGX highlight on a water film of the given
+    // roughness, with water's Fresnel. Light Strength scales both. The lights are looked up 4 units off the surface
+    // along n: on it, their shadow maps shadow the surface itself in stripes (measured on snow lit by an orthographic
+    // light).
+    float3 GroundLight(float3 p, float3 n, float3 v, float roughness, out float3 specular)
+    {
+        float3 diffuse = 0.0;
+        specular = 0.0;
+        const float a = max(roughness * roughness, 0.002);
+        const float nv = max(dot(n, v), 1e-4);
+        const float3 off = p + n * 4.0;
+        const int projected = g_bIsSFM ? (int)g_SFMLight_Count : 0;
+        const int count = (g_bUseSfmLights ? projected + g_vNumLights.x : 0) + (g_bUseSun ? 1 : 0);
+        for (int k = 0; k < count; k++)
+        {
+            float3 l;
+            float3 light;
+            if (g_bUseSun && k == count - 1)
+            {
+                l = g_vSunLightDir;
+                light = SunLightQuick(off);
+            }
+            else
+            {
+                light = S2fmLightAt(k < projected ? k : kListKey + k - projected, off, l);
+            }
+            const float nl = dot(n, l);
+            if (nl <= 0.0)
+                continue;
+            light *= g_flLightStrength;
+            diffuse += light * nl;
+            const float3 h = normalize(l + v);
+            const float nh = saturate(dot(n, h));
+            const float dd = nh * nh * (a * a - 1.0) + 1.0;
+            const float d = a * a / (3.14159265 * dd * dd);
+            const float kv = a * 0.5;
+            const float vis = 0.25 / ((nl * (1.0 - kv) + kv) * (nv * (1.0 - kv) + kv));
+            const float f = 0.02 + 0.98 * pow(1.0 - saturate(dot(v, h)), 5.0);
+            specular += light * (3.14159265 * d * vis * f * nl);
+        }
+        return diffuse;
+    }
+    #endif
+
+    // The curtain's share at a point u of the unit shape: as much as falls and as thick as Haze Density makes it,
+    // below the cloud base of a layer, under the clouds it fell from, in its showers and gusts, thinned by the virga,
+    // with its kind's texture, faded at the box's sides, just under the base and toward the end of its length.
+    float RainAt(Volume v, float3 u, float time)
+    {
+        if (g_flRainOn < 0.5 || g_flShape < 0.5)
+            return 0.0;
+        const float w = u.z * v.fallSign;                     // the height in the fall's own z
+        if (w >= v.rainTop)
+            return 0.0;
+        float3 lean = u;
+        lean.xy -= FallLean(v) * (v.rainTop - w);
+        const float3 q = NoiseSpace(v, lean);
+        const float under = WeatherAt(v, q);
+        if (under <= 0.0)
+            return 0.0;
+        const float fall = v.rainTop + 1.0 + v.rainBelow;     // the whole fall, in the unit box's z
+        const float grain = PrecipHazeTexture(float3(q.xy, q.z * v.fallSign), time);
+        const float2 side = 1.0 - abs(u.xy);
+        const float edge = saturate(min(side.x, side.y) / g_flEdgeFade);
+        const float end = saturate((w + 1.0 + v.rainBelow) / max(fall * 0.1, 1e-4));
+        const float below = (v.rainTop - w) * 0.5;            // under the band, in shares of the box's height
+        return g_flRainAmount * g_flHazeDensity * PrecipHazeLook().z * under * PrecipShowers(q.xy, mul(v.seedTurn, v.wind), time) *
+               PrecipVirga((v.rainTop - w) / fall) * (0.5 + 0.5 * grain) * edge * smoothstep(0.0, 0.05, below) * end;
+    }
+
+#if S_MODE_DEPTH
+    // The shadow the volume casts (the depth passes draw it, the shadow maps' among them). Along the pass's own view
+    // ray through the shape (from the light), where enough volume lies the depth of the shape's far side is written:
+    // the volume shades what lies beyond it, not its own inside (its march toward the key light does that). A shadow
+    // map holds no partial shadow, so the shape casts where it is more than half opaque: a clean silhouette that the
+    // map's own filtering softens (a dither here stays put under refinement and reads as speckles).
+    float MainPs(PixelInput i) : SV_Depth
+    {
+        // Into a shadow map only, which is never multisampled. A depth pass of a camera's own view is (S2FM's views
+        // are), and the far side's depth there would hide the sky behind the volume.
+        if (g_flCastShadow <= 0.0 || GetRenderTargetSampleCount() > 1)
+            discard;
+        const Volume v = VolumeFor(i, g_flTime);
+        const float3 camera = g_vCameraPositionWs;
+        const float3 dir = normalize(WorldPosition(i.vPositionWs) - camera);
+        const float3 o = mul(v.toObject, camera - v.origin) / v.half;
+        const float3 d = mul(v.toObject, dir) / v.half;
+        float2 hits = UnitShapeHits(o, d);
+        hits.x = max(hits.x, 0.0);
+        if (hits.x >= hits.y)
+            discard;
+        const float dt = (hits.y - hits.x) / 16.0;
+        float depth = 0.0;
+        [loop] for (int k = 0; k < 16; k++)
+        {
+            float h;
+            depth += CloudAt(v, o + d * (hits.x + (k + 0.5) * dt), false, h) * dt;
+        }
+        const float opacity = 1.0 - exp(-depth * v.sigma * g_flCastShadow);
+        if (opacity <= 0.5)
+            discard;
+        const float4 clip = mul(g_matWorldToProjectionMultiview[0],
+                                float4(camera + dir * hits.y, 1.0) + g_vWorldToCameraOffsetMultiview[0]);
+        return saturate(clip.z / clip.w);
+    }
+#elif S_SHADOW_ONLY
+    // Shadow Only: nothing on screen.
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        discard;
+        return 0.0;
+    }
+#else
+    // Whether the camera is inside the drawn shape (the box with its rain, or the ellipsoid): o in the unit shape.
+    bool Inside(Volume v, float3 o)
+    {
+        if (g_flShape > 0.5)
+            return all(abs(o.xy) <= 1.0) && abs(o.z * v.fallSign + v.rainBelow * 0.5) <= 1.0 + v.rainBelow * 0.5;
+        return dot(o, o) <= 1.0;
+    }
+
+    float4 MainPs(PixelInput i, bool front : SV_IsFrontFace) : SV_Target0
+    {
+        const float time = g_flTime;
+        const float2 pixel = i.vPositionPs.xy;
+        const Volume v = VolumeFor(i, time);
+        s_volume = v;
+        const float3 camera = g_vCameraPositionWs;
+        const float3 mesh = WorldPosition(i.vPositionWs);
+    #if S_SURFACES
+        // The carrier's steps to the next pixels, for the ground's normal (derivatives want uniform flow: here).
+        const float3 meshDx = ddx_fine(mesh), meshDy = ddy_fine(mesh);
+    #endif
+        const float3 dir = normalize(mesh - camera);
+        // The ray in the unit shape's space; a step along d is a world unit along the ray.
+        const float3 o = mul(v.toObject, camera - v.origin) / v.half;
+        const float3 d = mul(v.toObject, dir) / v.half;
+        // Both faces are drawn: the near one marches, the far one only for a camera inside (where there is no near one).
+        if (!front && !Inside(v, o))
+            return 0.0;
+        const float scene = SceneDistance(pixel, camera, dir);
+        s_sky = g_flRainOn > 0.5 ? SkyLight() : -1;
+        FogWeights();
+    #if S_SURFACES
+        s_ground = GroundAt(v, pixel, camera, dir, scene, mesh, meshDx, meshDy);
+    #endif
+        // The clouds' stretch of the ray (a layer's only in the height band they fill) and the rain's below it.
+        float2 hits = UnitShapeHits(o, d);
+        float2 rainHits = float2(1.0, 0.0);
+        if (g_flShape > 0.5)
+        {
+            const float lo = g_flCloudBase * 2.0 - 1.0, hi = g_flCloudTop * 2.0 - 1.0;
+            const float dz = abs(d.z) > 1e-8 ? d.z : 1e-8;
+            const float a = (lo - o.z) / dz, b = (hi - o.z) / dz;
+            hits = float2(max(hits.x, min(a, b)), min(hits.y, max(a, b)));
+            if (g_flRainOn > 0.5)
+                rainHits = BoxHits(float3(o.xy, o.z * v.fallSign), float3(d.xy, d.z * v.fallSign),
+                                   float3(-1.0, -1.0, -1.0 - v.rainBelow), float3(1.0, 1.0, v.rainTop));
+        }
+    #if S2VFX_DEBUG_VOLUME == 8
+        // Test only: how far the scene is along the ray, white at 4000 units and beyond, red under 300.
+        return float4(scene < 300.0 ? 1.0 : saturate(scene / 4000.0), saturate(scene / 4000.0).xx, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 10
+        // Test only: the sky light at the scene point: green open, red under cover, blue no sky light, black the sky.
+        if (scene >= 1e5)
+            return float4(0.0, 0.0, 0.0, 1.0);
+        const float skyOpen = SkyOpen(s_sky, camera + dir * scene + float3(0.0, 0.0, 2.0));
+        return s_sky < 0 ? float4(0.0, 0.0, 1.0, 1.0) : float4(1.0 - skyOpen, skyOpen, 0.0, 1.0);
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 9
+        // Test only: the ground's normal as a colour, black where the rain does not reach it.
+        return s_ground.foot > 0.0 ? float4(s_ground.n * 0.5 + 0.5, 1.0) : float4(0.0, 0.0, 0.0, 1.0);
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 11
+        // Test only: the sky map's heights: red a hollow (8 units deep full), green how far below the top (64 units
+        // full), black where the rain does not reach.
+        if (s_ground.foot <= 0.0)
+            return float4(0.0, 0.0, 0.0, 1.0);
+        return float4(saturate(s_ground.heights.x / 8.0), saturate(s_ground.heights.y / 64.0), 0.0, 1.0);
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 24
+        // Test only: the raw scene depth at this pixel, stretched: red its fractions of 0.001 (bands), green 0.93 to 0.95,
+        // blue above 0.95 (the clear and the sky).
+        {
+            const float raw = g_tSceneDepth.Load(int3(InViewport(pixel), 0)).r;
+            return float4(frac(raw * 1000.0), saturate((raw - 0.93) * 50.0), raw > 0.95 ? 1.0 : 0.0, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 22
+        // Test only: the sky light's map seen from above, its whole part of the atlas over the viewport: the height of
+        // what it holds above the scene point's level at the screen's middle row, as contours every 100 units (red),
+        // white over 1000 up; the camera a green dot, this pixel's scene point's place blue where it falls.
+        {
+            if (s_sky < 0)
+                return float4(0.0, 0.0, 0.0, 1.0);
+            const float4 b = g_vSpotLightShadowBounds[s_sky];
+            const float2 t = (pixel - g_vViewportOffset) / g_vViewportSize;
+            const float2 uv = lerp(b.xy, b.zw, t);
+            const float stored = g_tVrShadowDepthBufferDepth.SampleLevel(g_sSkyPoint, uv, 0).r;
+            // Heights from depths: the map's depth at the camera's place and 100 units below it.
+            bool unused;
+            const float3 at = SkyUvz(s_sky, camera, unused);
+            const float3 lower = SkyUvz(s_sky, camera - float3(0.0, 0.0, 100.0), unused);
+            const float perUnit = (lower.z - at.z) / 100.0;
+            const float height = (stored - at.z) / perUnit;     // below the camera's height, world units
+            const float up = -height;                            // above it
+            const float3 shade = float3(frac(up / 100.0) < 0.08 ? 1.0 : 0.0, saturate(up / 2000.0 + 0.5) * 0.3,
+                                        up > 1000.0 ? 1.0 : 0.0);
+            const float2 camUv = (at.xy - b.xy) / (b.zw - b.xy);
+            if (length((t - camUv) * g_vViewportSize) < 6.0)
+                return float4(0.0, 1.0, 0.0, 1.0);
+            return float4(shade, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 21
+        // Test only: the ground's values as bits in panels (8 across, 6 down; in each, 12 rows of 32 bits, white 1, the
+        // most significant on the left), each panel the values of its own pixels, for a capture to read back: the
+        // normal (x, y, z), open, the heights (x, y), the four neighbours' distances from the point (right, left, down,
+        // up), the carrier's step to the next pixel right (its length), and foot.
+        {
+            const float2 local = frac((pixel - g_vViewportOffset) / g_vViewportSize * float2(8.0, 6.0));
+            const int bitAt = (int)(local.x * 32.0);
+            const int valueAt = (int)(local.y * 12.0);
+            const Ground g = s_ground;
+            const float3 nr = ScenePointAlong(pixel + float2(1.0, 0.0), camera, normalize(mesh + meshDx - camera));
+            const float3 nl = ScenePointAlong(pixel - float2(1.0, 0.0), camera, normalize(mesh - meshDx - camera));
+            const float3 nd = ScenePointAlong(pixel + float2(0.0, 1.0), camera, normalize(mesh + meshDy - camera));
+            const float3 nu = ScenePointAlong(pixel - float2(0.0, 1.0), camera, normalize(mesh - meshDy - camera));
+            const float values[12] = { g.n.x, g.n.y, g.n.z, g.open, g.heights.x, g.heights.y, length(nr - g.p),
+                                       length(nl - g.p), length(nd - g.p), length(nu - g.p), length(meshDx), g.foot };
+            const uint bits = asuint(values[clamp(valueAt, 0, 11)]);
+            const float on = (float)((bits >> (31 - clamp(bitAt, 0, 31))) & 1u);
+            return float4(on, on, on, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 25
+        // Test only: the ground's light as bits in panels (as view 21): the scene's colour behind (r, g, b), the light
+        // GroundLight finds there (diffuse r, g, b), the probe's ambient for its normal (r, g, b, with no strength on
+        // it), the masks (wet, puddle, snow).
+        {
+            const float2 local = frac((pixel - g_vViewportOffset) / g_vViewportSize * float2(8.0, 6.0));
+            const int bitAt = (int)(local.x * 32.0);
+            const int valueAt = (int)(local.y * 12.0);
+            const Ground g = s_ground;
+            const float3 seenBehind = SceneBehind(pixel, 0.0);
+            float3 specular;
+            const float3 lit = GroundLight(g.p, g.n, normalize(camera - g.p), 0.3, specular);
+            const float3 ambient = AmbientAt(g.p, g.n);
+            const float3 masks = g.foot > 0.0 ? GroundMasks(g, time) : -1.0;
+            const float values[12] = { seenBehind.r, seenBehind.g, seenBehind.b, lit.r, lit.g, lit.b, ambient.r, ambient.g,
+                                       ambient.b, masks.x, masks.y, masks.z };
+            const uint bits = asuint(values[clamp(valueAt, 0, 11)]);
+            const float on = (float)((bits >> (31 - clamp(bitAt, 0, 31))) & 1u);
+            return float4(on, on, on, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 26
+        // Test only: the snow's light as bits in panels (as view 21): GroundLight's diffuse (r, g, b), the engine's light
+        // read off the scene (its luminance over 0.25), the snow's colour (r, g, b), the snow mask, open, the normal's
+        // z, the scene's luminance behind (unblurred) and the S2FM ambient's.
+        {
+            const float2 local = frac((pixel - g_vViewportOffset) / g_vViewportSize * float2(8.0, 6.0));
+            const int bitAt = (int)(local.x * 32.0);
+            const int valueAt = (int)(local.y * 12.0);
+            const Ground g = s_ground;
+            const float3 luma = float3(0.2126, 0.7152, 0.0722);
+            float3 specular;
+            const float3 lit = GroundLight(g.p, g.n, normalize(camera - g.p), 0.3, specular);
+            const float engine = dot(SceneBehind(pixel, 4.0), luma) / 0.25;
+            float3 add;
+            GroundShade(g, camera, pixel, time, add);
+            const float snow = g.foot > 0.0 ? GroundMasks(g, time).z : -1.0;
+            const float values[12] = { lit.r, lit.g, lit.b, engine, add.r, add.g, add.b, snow, g.open, g.n.z,
+                                       dot(SceneBehind(pixel, 0.0), luma), dot(g_vToolsAmbientLightingVr.xyz, luma) };
+            const uint bits = asuint(values[clamp(valueAt, 0, 11)]);
+            const float on = (float)((bits >> (31 - clamp(bitAt, 0, 31))) & 1u);
+            return float4(on, on, on, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 20
+        // Test only: twelve floats as their 32 bits (white 1), a row each, the most significant bit on the left, for a
+        // capture to read back exactly: the sky light's shadow bounds (4), the scene point's place in its map (x, y, z
+        // after the divide), the projection's w, the scene point's z, the light's position z and direction z, and the
+        // sky light's index.
+        {
+            const float2 cell = (pixel - g_vViewportOffset) / g_vViewportSize * float2(32.0, 12.0);
+            const int bitAt = (int)cell.x;
+            const int valueAt = (int)cell.y;
+            const int n = max(s_sky, 0);
+            const float3 sp = camera + dir * scene;
+            const float4 q = mul(g_matWorldToShadow[n], float4(sp - g_vHighPrecisionLightingOffsetWs.xyz, 1.0));
+            const float values[12] = { g_vSpotLightShadowBounds[n].x, g_vSpotLightShadowBounds[n].y,
+                                       g_vSpotLightShadowBounds[n].z, g_vSpotLightShadowBounds[n].w,
+                                       q.x / q.w, q.y / q.w, q.z / q.w, q.w, sp.z,
+                                       g_vLightPosition_flInvRadius[n].z, g_vLightDirection[n].z, (float)s_sky };
+            const uint bits = asuint(values[clamp(valueAt, 0, 11)]);
+            const float on = (float)((bits >> (31 - clamp(bitAt, 0, 31))) & 1u);
+            return float4(on, on, on, 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 12
+        // Test only: what has gathered on the ground: red wet, green puddle, blue snow, black where the rain does not
+        // reach it.
+        if (s_ground.foot <= 0.0)
+            return float4(0.0, 0.0, 0.0, 1.0);
+        return float4(GroundMasks(s_ground, time), 1.0);
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 27
+        // Test only: red wet (half), green puddle, blue how much light GroundShade adds (its luminance x 4), black where
+        // the rain does not reach.
+        {
+            if (s_ground.foot <= 0.0)
+                return float4(0.0, 0.0, 0.0, 1.0);
+            float3 add;
+            GroundShade(s_ground, camera, pixel, time, add);
+            const float3 masks = GroundMasks(s_ground, time);
+            return float4(masks.x * 0.5, masks.y, saturate(dot(add, float3(0.2126, 0.7152, 0.0722)) * 4.0), 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 28
+        // Test only: red the corner flag, green how level the normal is (as GroundShade takes it), blue how much light
+        // GroundShade adds (its luminance x 4), the outline flag as white over all; black where the rain does not reach.
+        {
+            if (s_ground.foot <= 0.0)
+                return float4(0.0, 0.0, 0.0, 1.0);
+            float3 add;
+            GroundShade(s_ground, camera, pixel, time, add);
+            const float3 flags = float3(s_ground.corner, smoothstep(0.9, 0.97, s_ground.n.z),
+                                        saturate(dot(add, float3(0.2126, 0.7152, 0.0722)) * 4.0));
+            return float4(lerp(flags, 1.0, s_ground.outline), 1.0);
+        }
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 13
+        // Test only: the ripples' slope on the ground (green x, blue y), black where the rain does not reach it.
+        if (s_ground.foot <= 0.0)
+            return float4(0.0, 0.0, 0.0, 1.0);
+        return float4(0.0, RippleSlope(s_ground.p, time) * 2.0 + 0.5, 1.0);
+    #endif
+    #if S_SURFACES && S2VFX_DEBUG_VOLUME == 14
+        // Test only: views 9, 10 and 11 side by side, in thirds of the viewport (left to right). Where the rain does not
+        // reach the scene, why, in dark colours: blue no scene (sky), red outside the box's footprint, green above the
+        // rain's top, grey below its end.
+        if (s_ground.foot <= 0.0)
+        {
+            const float3 su = mul(v.toObject, camera + dir * scene - v.origin) / v.half;
+            const float sw = su.z * v.fallSign;
+            if (scene >= 1e5)
+                return float4(0.0, 0.0, 0.25, 1.0);
+            if (any(abs(su.xy) >= 1.0))
+                return float4(0.25, 0.0, 0.0, 1.0);
+            if (sw >= v.rainTop)
+                return float4(0.0, 0.25, 0.0, 1.0);
+            return float4(0.15, 0.15, 0.15, 1.0);
+        }
+        const float third = (pixel.x - g_vViewportOffset.x) / g_vViewportSize.x * 3.0;
+        if (third < 1.0)
+            return float4(s_ground.n * 0.5 + 0.5, 1.0);
+        if (third < 2.0)
+            return s_sky < 0 ? float4(0.0, 0.0, 1.0, 1.0) : float4(1.0 - s_ground.open, s_ground.open, 0.0, 1.0);
+        return float4(saturate(s_ground.heights.x / 8.0), saturate(s_ground.heights.y / 64.0), 0.0, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 5
+        // Test only: which stretches the ray has, in plain on/off colours: red the rain's, green the clouds' after the
+        // scene's depth cut it, blue the clouds' before.
+        const float2 uncut = float2(max(hits.x, 0.0), hits.y);
+        const float2 cut = float2(uncut.x, min(uncut.y, scene));
+        const float2 rainCut = float2(max(rainHits.x, 0.0), min(rainHits.y, scene));
+        return float4(rainCut.x < rainCut.y ? 1.0 : 0.0, cut.x < cut.y ? 1.0 : 0.0, uncut.x < uncut.y ? 1.0 : 0.0, 1.0);
+    #endif
+        hits = float2(max(hits.x, 0.0), min(hits.y, scene));
+        rainHits = float2(max(rainHits.x, 0.0), min(rainHits.y, scene));
+        if (hits.x >= hits.y && rainHits.x >= rainHits.y)
+            return 0.0;
+    #if S2VFX_DEBUG_VOLUME == 1
+        // Test only: how far the ray runs inside the shape, a cloud width white.
+        return float4((hits.y - hits.x) / max(v.worldUnit, 1e-3), 0.0, 0.0, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 3
+        // Test only: the lights this pass has, in plain on/off colours (the exposure cannot hide them): red none, green
+        // one or more, blue three or more; the projected lights on the left half, the light list on the right.
+        const float count = pixel.x < g_vViewportOffset.x + g_vViewportSize.x * 0.5 ? (g_bIsSFM ? g_SFMLight_Count : 0.0)
+                                                                                    : (float)g_vNumLights.x;
+        return float4(count < 0.5 ? 1.0 : 0.0, count >= 0.5 ? 1.0 : 0.0, count >= 2.5 ? 1.0 : 0.0, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 4
+        // Test only: the key light: white the sun, yellow a projected light, a light list light in its own hue,
+        // black none.
+        const int keyShown = ChooseKey(v.origin);
+        if (keyShown == -1)
+            return float4(1.0, 1.0, 1.0, 1.0);
+        if (keyShown >= kListKey)
+        {
+            const float3 hue = g_vLightColor[keyShown - kListKey].xyz;
+            return float4(hue / max(max(hue.r, hue.g), max(hue.b, 1e-6)), 1.0);
+        }
+        return keyShown >= 0 ? float4(1.0, 1.0, 0.0, 1.0) : float4(0.0, 0.0, 0.0, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 2
+        // Test only: the field's density along the ray, averaged, grey.
+        float sum = 0.0;
+        [loop] for (int n = 0; n < 32; n++)
+        {
+            float hh;
+            sum += CloudAt(v, o + d * lerp(hits.x, hits.y, (n + 0.5) / 32.0), true, hh);
+        }
+        return float4((sum / 32.0).xxx, 1.0);
+    #endif
+        // The precipitation's particles along the rain's stretch (s2vfx/precipitation.hlsl), lit by the lightning too.
+        const float4 flash = LightningNow(time, v.seed);
+        s_flash = float4(v.origin + mul(v.toWorld, flash.xyz * v.half), flash.w);
+        float3 wind = mul(v.toWorld, float3(v.wind, 0.0));
+        wind = float3(wind.xy, 0.0) / max(length(wind.xy), 1e-4);
+        const PrecipResult precip = PrecipParticles(camera, dir, rainHits, scene, pixel, wind, time);
+    #if S2VFX_DEBUG_VOLUME == 6
+        // Test only: the particles hit, by the scale of the nearest (red near, green middle, blue far), black none.
+        if (precip.level >= 0.0)
+            return float4(precip.level < 0.5 ? 1.0 : 0.0, abs(precip.level - 1.0) < 0.5 ? 1.0 : 0.0, precip.level > 1.5 ? 1.0 : 0.0, 1.0);
+        return float4(0.0, 0.0, 0.0, 1.0);
+    #endif
+    #if S2VFX_DEBUG_VOLUME == 7
+        // Test only: how many particles the ray hit, an eighth of white each, red at eight or more.
+        return float4(saturate(precip.hits / 8.0), precip.hits < 8.0 ? (precip.hits / 8.0).xx : 0.0, 1.0);
+    #endif
+        // The two stretches never overlap along a ray (slabs of one column): the nearer is marched first, then the
+        // farther, the rain's curtain in a quarter of the steps, at most 32 (it is soft, and each step weighs every
+        // light). A start a fraction of a step in: from the pixel's own position, which S2FM's refinement shifts by a
+        // fraction of a pixel each pass, so the passes average the steps' grain away. Near the camera the curtain
+        // gives way to the particles.
+        const int steps = (int)clamp(g_flQuality, 8.0, 256.0);
+        const int rainSteps = clamp(steps / 4, 8, 32);
+        const float4 hazeLook = PrecipHazeLook();
+        const float3 hazeTint = SrgbGammaToLinear(g_vHazeColor) * g_flHazeBrightness;
+        // The rain's stretch is the nearer one where the clouds' is empty (an empty stretch's start means nothing).
+        const bool rainFirst = hits.x >= hits.y || rainHits.x < hits.x;
+        const float2 nearHits = rainFirst ? rainHits : hits, farHits = rainFirst ? hits : rainHits;
+        const int nearSteps = nearHits.x < nearHits.y ? (rainFirst ? rainSteps : steps) : 0;
+        const int farSteps = farHits.x < farHits.y ? (rainFirst ? steps : rainSteps) : 0;
+        const float jitter = Hash13(i.vPositionWs * 7.31 + 0.37);
+        const int key = ChooseKey(v.origin);
+        float transmittance = 1.0;
+        float3 scatter = 0.0;
+        float rainDepth = 0.0;
+        float fogWeight = 0.0, fogDistance = 0.0;
+        [loop] for (int k = 0; k < nearSteps + farSteps; k++)
+        {
+            const bool inNear = k < nearSteps;
+            const float2 stretch = inNear ? nearHits : farHits;
+            const float dt = (stretch.y - stretch.x) / (inNear ? nearSteps : farSteps);
+            const float t = stretch.x + ((inNear ? k : k - nearSteps) + jitter) * dt;
+            const float3 u = o + d * t;
+            const float3 p = camera + dir * t;
+            float h = 0.0, c = 0.0, rain = 0.0;
+            if (inNear == rainFirst)
+                rain = RainAt(v, u, time);
+            else
+                c = CloudAt(v, u, true, h);
+            if (c <= 0.0 && rain <= 0.0)
+                continue;
+            // The curtain, not under a roof (the sky light).
+            const float sigmaR = rain > 0.0 ? rain * v.rainSigma * PrecipHazeFade(t) * SkyOpen(s_sky, p) : 0.0;
+            const float sigmaT = c * v.sigma + sigmaR;
+            const float stepT = exp(-sigmaT * dt);
+            if (sigmaT * dt < 1e-4)
+            {
+                // Too thin to show: only its share of the light let through, no lighting.
+                transmittance *= stepT;
+                continue;
+            }
+            // The curtain sends on the light of the sky, the sun and every S2FM light (forward for rain, evenly for
+            // snow; Haze Glow how far forward), as bright and in the colour the Haze group gives, and the rainbow's
+            // colours where the sun is behind the camera.
+            float3 source = 0.0;
+            if (sigmaR > 0.0)
+                source = (PrecipLight(p, dir, hazeLook.y * g_flHazeGlow) * hazeLook.x * hazeTint +
+                          PrecipRainbow(dir, g_vSunLightDir) * SunLightQuick(p)) * sigmaR;
+            if (c > 0.0)
+                source += InScatter(v, key, u, p, dir, h, c, flash) * c * v.sigma * (1.0 - g_flAbsorption) + EmissionAt(c) * c;
+            scatter += transmittance * (source - source * stepT) / max(sigmaT, 1e-6);
+            rainDepth += sigmaR * dt * transmittance;
+            const float seen = transmittance * (1.0 - stepT);
+            fogWeight += seen;
+            fogDistance += seen * t;
+            transmittance *= stepT;
+            if (transmittance < 0.01)
+                break;
+        }
+        if (fogWeight > 1e-4 && transmittance < 0.999)
+        {
+            // The map's fog at the distance the volume is mostly seen at, on the volume's own colour (what is behind
+            // it was fogged when it was drawn).
+            const float3 at = camera + dir * (fogDistance / fogWeight) - g_vHighPrecisionLightingOffsetWs.xyz;
+            const float cover = 1.0 - transmittance;
+            scatter = ApplyFog(scatter / cover, at, pixel) * cover;
+        }
+        float3 color = scatter;
+        float behind = transmittance;
+        float3 shifted = 0.0;
+        if (rainDepth > 0.0 && g_flHazeRefraction > 0.0)
+        {
+            // What is seen through the rain: shifted along falling streaks and blurred, as much as there is rain and
+            // as Haze Refraction asks. The blend gives color + target * behind, so the frame copy's shifted picture
+            // stands in for that share of what is behind. Not shifted onto another surface (a tenth nearer or
+            // farther): its colour, under this surface's wetness, would show along the edge as an outline.
+            const float k = saturate(rainDepth * 2.0) * g_flHazeRefraction;
+            const float2 wobble = DetailNoise(float3(pixel / 220.0, time * g_flRainSpeed * 0.5)).rg * 2.0 - 1.0;
+            const float2 shift = float2(wobble.x * 3.0, wobble.y * 8.0) * k;
+            const float2 at = abs(SceneDistance(pixel + shift, camera, dir) - scene) > scene * 0.1 ? pixel : pixel + shift;
+            shifted = transmittance * k * SceneBehind(at, k * 4.0);
+            behind = transmittance * (1.0 - k);
+        }
+    #if S_SURFACES
+        // What the precipitation has made of the ground (wet, puddles, snow), under the haze and the particles: it is
+        // the scene behind them, the blend's share and the shifted picture alike, so both are darkened (or covered),
+        // and what it adds comes through all the haze lets through.
+        float3 groundAdd;
+        const float groundMul = GroundShade(s_ground, camera, pixel, time, groundAdd);
+        shifted = shifted * groundMul + transmittance * groundAdd;
+        behind *= groundMul;
+    #endif
+        color += shifted;
+        // The particles in front of the curtain and the clouds where the rain's stretch is nearer, behind them where
+        // the clouds are (the camera above the band).
+        if (rainFirst)
+        {
+            color = precip.color + precip.transmittance * color;
+            behind *= precip.transmittance;
+        }
+        else
+        {
+            color += behind * precip.color;
+            behind *= precip.transmittance;
+        }
+        // The engine's particles come after this pass: the mod pack keeps them back and draws them after it
+        // (particle_order.cpp), as they are seen in front of the volume.
+        return float4(color, 1.0 - behind);
+    }
+#endif
+}

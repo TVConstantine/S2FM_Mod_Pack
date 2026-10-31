@@ -1,0 +1,687 @@
+// A lit model shader with vr_complex's material: a colour texture and tint (S2FM's model colour mixed in, a tint mask),
+// the texture coordinates moved, scaled and scrolled, a second uv for some textures, a normal map with the roughness
+// in it, ambient occlusion, metalness (a slider or a texture, both remapped), the specular's IOR, level and tint, a
+// detail texture (Mod2X, Overlay, Normals, or Overlay and Normals), the flexes' wrinkle maps (squish and stretch), self
+// illumination, see-through (translucent, additive, alpha test), a clear coat, sheen, anisotropy, subsurface
+// scattering and environment map reflections (F_SPECULAR), shaded by Source 2's own lights, shadows, ambient,
+// environment maps and fog with our own surface (include/s2vfx/lighting.hlsl: GGX with height-correlated Smith and
+// multiple scattering, F82 Fresnel, EON diffuse under the specular layer), and fog (fog.hlsl). The textures and
+// parameters have vr_complex's names, channels and formats, so a vr_complex material moves over by changing its
+// shader.
+//
+// The newer switches (see-through, tint mask, second uv, no shadows) follow the material's features without static
+// combos of their own: their render states and attributes are expressions of the features the engine works out, and
+// the code reads them as values (FeatureToInt). The older ones are UiOnly combos, which only show their parts.
+
+HEADER
+{
+    Description = "Lit: vr_complex's material under the engine's lights";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    Feature(F_RENDER_BACKFACES, 0..1, "Rendering");
+    Feature(F_DO_NOT_CAST_SHADOWS, 0..1, "Rendering");
+    Feature(F_TRANSLUCENT, 0..1, "Translucent");
+    Feature(F_ADDITIVE_BLEND, 0..1, "Translucent");
+    Feature(F_ALPHA_TEST, 0..1, "Translucent");
+    Feature(F_TINT_MASK, 0..1, "Color");
+    Feature(F_SECONDARY_UV, 0..1, "Texture Coordinates");
+    Feature(F_DETAIL_TEXTURE, 0..4 (0="None", 1="Mod2X", 2="Overlay", 3="Normals", 4="Overlay and Normals"), "Detail Texture");
+    Feature(F_WRINKLE, 0..1, "Animation");
+    Feature(F_SPECULAR, 0..1, "PBR");
+    // Each of these only shows its part in the Material Editor (UiOnly below): the code is the same for every value,
+    // the part's switch is the feature's value.
+    Feature(F_METALNESS_TEXTURE, 0..1, "PBR");
+    Feature(F_SELF_ILLUM, 0..1, "PBR");
+    Feature(F_CLEARCOAT, 0..1, "PBR");
+    Feature(F_SHEEN, 0..1, "PBR");
+    Feature(F_ANISOTROPY, 0..1, "PBR");
+    Feature(F_SUBSURFACE, 0..1, "PBR");
+    // Special effects, the same way (UiOnly), each its own switch in the SFX group.
+    Feature(F_PEARLESCENCE, 0..1, "SFX");
+    Feature(F_IRIDESCENCE, 0..1, "SFX");
+    Feature(F_GLITTER, 0..1, "SFX");
+    Feature(F_HOLOGRAPHIC, 0..1, "SFX");
+}
+
+COMMON
+{
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    // The second uv is read only when the material asks for it: a mesh without one still draws.
+    StaticCombo(S_SECONDARY_UV, F_SECONDARY_UV, Sys(ALL));
+
+    #include "s2vfx/vertex.hlsl"
+
+    BoolAttribute(environmentmapped, true);
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_RENDER_BACKFACES, F_RENDER_BACKFACES, Sys(ALL));
+    StaticCombo(S_DETAIL_TEXTURE, F_DETAIL_TEXTURE, Sys(ALL));
+    StaticCombo(S_WRINKLE, F_WRINKLE, Sys(ALL));
+    StaticCombo(S_SPECULAR, F_SPECULAR, Sys(ALL));
+    StaticCombo(S_METALNESS_TEXTURE, F_METALNESS_TEXTURE, Sys(ALL), UiOnly(g_flMetalnessTextureOn));
+    StaticCombo(S_SELF_ILLUM, F_SELF_ILLUM, Sys(ALL), UiOnly(g_flSelfIllumOn));
+    StaticCombo(S_CLEARCOAT, F_CLEARCOAT, Sys(ALL), UiOnly(g_flClearcoatOn));
+    StaticCombo(S_SHEEN, F_SHEEN, Sys(ALL), UiOnly(g_flSheenOn));
+    StaticCombo(S_ANISOTROPY, F_ANISOTROPY, Sys(ALL), UiOnly(g_flAnisotropyOn));
+    StaticCombo(S_SUBSURFACE, F_SUBSURFACE, Sys(ALL), UiOnly(g_flSubsurfaceOn));
+    StaticCombo(S_PEARLESCENCE, F_PEARLESCENCE, Sys(ALL), UiOnly(g_flPearlescenceOn));
+    StaticCombo(S_IRIDESCENCE, F_IRIDESCENCE, Sys(ALL), UiOnly(g_flIridescenceOn));
+    StaticCombo(S_GLITTER, F_GLITTER, Sys(ALL), UiOnly(g_flGlitterOn));
+    StaticCombo(S_HOLOGRAPHIC, F_HOLOGRAPHIC, Sys(ALL), UiOnly(g_flHolographicOn));
+
+    RenderState(CullMode, S_RENDER_BACKFACES ? NONE : DEFAULT);
+    BoolAttribute(renderbackfaces, S_RENDER_BACKFACES ? true : false);
+
+    // See-through, as vr_complex has it: blended (straight alpha) or added, neither writing depth; alpha test cuts.
+    RenderState(BlendEnable, F_TRANSLUCENT || F_ADDITIVE_BLEND ? true : false);
+    RenderState(SrcBlend, SRC_ALPHA);
+    RenderState(DstBlend, F_ADDITIVE_BLEND ? ONE : INV_SRC_ALPHA);
+    RenderState(DepthWriteEnable, F_TRANSLUCENT || F_ADDITIVE_BLEND ? false : true);
+    BoolAttribute(translucent, F_TRANSLUCENT || F_ADDITIVE_BLEND ? true : false);
+    BoolAttribute(alphatest, F_ALPHA_TEST ? true : false);
+    BoolAttribute(NoZPrepass, F_TRANSLUCENT || F_ADDITIVE_BLEND || F_ALPHA_TEST ? true : false);
+    BoolAttribute(DoNotCastShadows, F_DO_NOT_CAST_SHADOWS || F_ADDITIVE_BLEND ? true : false);
+
+    #include "s2vfx/lighting.hlsl"
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"
+
+    int g_nTranslucent < FeatureToInt(F_TRANSLUCENT); >;
+    int g_nAdditive < FeatureToInt(F_ADDITIVE_BLEND); >;
+    int g_nAlphaTest < FeatureToInt(F_ALPHA_TEST); >;
+    int g_nTintMask < FeatureToInt(F_TINT_MASK); >;
+    int g_nSecondaryUv < FeatureToInt(F_SECONDARY_UV); >;
+
+    // ------------------------------------------------------------------------------------------ colour and normal
+    float3 g_vColorTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Color,10/20"); >;
+    // How much of S2FM's model colour the surface takes (vr_complex's), and with F_TINT_MASK where (white: all).
+    float g_flModelTintAmount < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Color,10/30"); >;
+    float g_flMetalness < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Metalness,27/20"); >;
+    float g_flNormalMapScaleFactor < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Normal,20/30"); >;
+
+    CreateInputTexture2D(TextureTintMask, Linear, 8, "", "_mask", "Color,10/40", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tTintMask < Channel(R, Box(TextureTintMask), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ texture coordinates
+    // vr_complex's: the mesh's uv scaled, moved and scrolled for every texture but the detail ones (which have their
+    // own). With F_SECONDARY_UV the mesh's second uv for the textures that ask for it (vr_complex's checkboxes and
+    // defaults), as it is.
+    float2 g_vTexCoordScale < UiType(VectorText); Default2(1.0, 1.0); Range2(0.0, 0.0, 500.0, 500.0); UiGroup("Texture Coordinates,80/10"); >;
+    float2 g_vTexCoordOffset < UiType(VectorText); Default2(0.0, 0.0); Range2(-10.0, -10.0, 10.0, 10.0); UiGroup("Texture Coordinates,80/20"); >;
+    float2 g_vTexCoordScrollSpeed < UiType(VectorText); Default2(0.0, 0.0); Range2(-50.0, -50.0, 50.0, 50.0); UiGroup("Texture Coordinates,80/30"); >;
+    bool g_bUseSecondaryUvForAmbientOcclusion < UiType(CheckBox); Default(1); UiGroup("Texture Coordinates,80/40"); >;
+    bool g_bUseSecondaryUvForDetailTexture < UiType(CheckBox); Default(1); UiGroup("Texture Coordinates,80/50"); >;
+    bool g_bUseSecondaryUvForDetailMask < UiType(CheckBox); Default(1); UiGroup("Texture Coordinates,80/60"); >;
+    bool g_bUseSecondaryUvForSelfIllum < UiType(CheckBox); Default(0); UiGroup("Texture Coordinates,80/70"); >;
+    bool g_bUseSecondaryUvForTintMask < UiType(CheckBox); Default(0); UiGroup("Texture Coordinates,80/80"); >;
+
+    // ------------------------------------------------------------------------------------------ translucent
+    // vr_complex's: opacity from the translucency texture (its grey: an image's red channel) times the scale;
+    // alpha test cuts below the reference, here and in the shadows. A translucent surface casts a shadow where it is
+    // more than half there (or where its alpha test leaves it).
+    float g_flOpacityScale < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Translucent,15/20"); >;
+    float g_flAlphaTestReference < UiType(Slider); Default(0.5); Range(0.01, 0.99); UiGroup("Translucent,15/30"); >;
+
+    CreateInputTexture2D(TextureTranslucency, Linear, 8, "", "_trans", "Translucent,15/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tTranslucency < Channel(R, Box(TextureTranslucency), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ specular
+    // Not in vr_complex (OpenPBR's and Blender's): the dielectric's IOR (1.5: 4% straight back, water 1.33, gems up
+    // to 2.4), a level that scales that reflection (0: none, 1: as the IOR says) and a tint that colours it; on metal
+    // the tint is the colour its edges turn (F82). Diffuse Roughness: EON's (0: Lambert, 1: chalk and clay), the
+    // surface's own roughness when Diffuse Roughness From Roughness is ticked.
+    float g_flSpecularIor < UiType(Slider); Default(1.5); Range(1.0, 3.0); UiGroup("Specular,25/10"); >;
+    float g_flSpecularLevel < UiType(Slider); Default(1.0); Range(0.0, 4.0); UiGroup("Specular,25/20"); >;
+    float3 g_vSpecularTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Specular,25/30"); >;
+    bool g_bDiffuseRoughnessFromRoughness < UiType(CheckBox); Default(1); UiGroup("Specular,25/40"); >;
+    float g_flDiffuseRoughness < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Specular,25/50"); >;
+    float g_flAmbientOcclusionDirectDiffuse < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Ambient Occlusion,40/20"); >;
+    float g_flAmbientOcclusionDirectSpecular < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Ambient Occlusion,40/30"); >;
+
+    // ------------------------------------------------------------------------------------------ roughness and metalness
+    // Not in vr_complex. The roughness (the normal map's third channel) is remapped from 0..1 to Min..Max: equal
+    // values give one roughness all over, Min above Max turns it round. Metalness is the slider, or with Metalness
+    // Texture (F_METALNESS_TEXTURE) the texture (vr_complex's TextureMetalness; its slider is then not used, as
+    // vr_complex has it), remapped the same way. Multiscatter GGX gives back the light a rough surface loses between
+    // its microfacets.
+    float g_flRoughnessRemapMin < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Roughness,23/20"); >;
+    float g_flRoughnessRemapMax < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Roughness,23/30"); >;
+    bool g_bMultiscatter < UiType(CheckBox); Default(1); UiGroup("Roughness,23/40"); >;
+    float g_flMetalnessTextureOn < Default(0.0); >;
+    float g_flMetalnessRemapMin < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Metalness,27/30"); UiFeature(F_METALNESS_TEXTURE); >;
+    float g_flMetalnessRemapMax < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Metalness,27/40"); UiFeature(F_METALNESS_TEXTURE); >;
+
+    CreateInputTexture2D(TextureColor, Srgb, 8, "", "_color", "Color,10/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureNormal, Linear, 8, "NormalizeNormals", "_normal", "Normal,20/10", Default3(0.5, 0.5, 1.0));
+    CreateInputTexture2D(TextureRoughness, Linear, 8, "Inverse", "_rough", "Roughness,23/10", Default3(0.5, 0.5, 0.5));
+    CreateInputTexture2D(TextureAmbientOcclusion, Linear, 8, "", "_ao", "Ambient Occlusion,40/10", Default3(1.0, 1.0, 1.0));
+    // "_metal": the Material Editor's stand in is black (no metal) when no texture is given.
+    CreateInputTexture2D(TextureMetalness, Linear, 8, "", "_metal", "Metalness,27/10", Default3(0.0, 0.0, 0.0));
+
+    Texture2D g_tColor < Channel(RGB, Box(TextureColor), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    Texture2D g_tNormal < Channel(RGBA, HemiOctIsoRoughness_RG_B(TextureNormal, TextureRoughness), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    Texture2D g_tAmbientOcclusion < Channel(R, Box3(TextureAmbientOcclusion), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+    Texture2D g_tMetalness < Channel(R, Box(TextureMetalness), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_METALNESS_TEXTURE); >;
+    SamplerState g_sColor < Filter(ANISOTROPIC); MaxAniso(8); AddressU(WRAP); AddressV(WRAP); >;
+
+    // ------------------------------------------------------------------------------------------ detail texture
+    float g_flDetailBlendFactor < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Detail Texture,80/20"); >;
+    float g_flDetailBlendToFull < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Detail Texture,80/50"); >;
+    float g_flDetailNormalStrength < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Detail Texture,80/15"); >;
+    float2 g_vDetailTexCoordScale < UiType(VectorText); Default2(1.0, 1.0); UiGroup("Detail Texture,80/30"); >;
+    float g_flDetailTexCoordRotation < UiType(Slider); Default(0.0); Range(0.0, 360.0); UiGroup("Detail Texture,80/35"); >;
+    float2 g_vDetailTexCoordOffset < UiType(VectorText); Default2(0.0, 0.0); Range2(-1.0, -1.0, 1.0, 1.0); UiGroup("Detail Texture,80/40"); >;
+
+    CreateInputTexture2D(TextureDetail, Linear, 8, "Mod2XCenter", "_detail", "Detail Texture,80/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureNormalDetail, Linear, 8, "NormalizeNormals", "_normal", "Detail Texture,80/10", Default3(0.5, 0.5, 1.0));
+    CreateInputTexture2D(TextureDetailMask, Linear, 8, "", "_detailmask", "Detail Texture,80/40", Default3(1.0, 1.0, 1.0));
+
+    Texture2D g_tDetail < Channel(RGB, Box(TextureDetail), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    Texture2D g_tNormalDetail < Channel(RG, HemiOctIsoRoughness_RG_B(TextureNormalDetail), Linear); OutputFormat(ATI2N); SrgbRead(false); >;
+    Texture2D g_tDetailMask < Channel(R, Box(TextureDetailMask), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ wrinkles
+    bool g_bWrinkleOverride < UiType(CheckBox); Default(0); UiGroup("Wrinkle/10"); >;
+    float g_flWrinkleOverride < UiType(Slider); Default(0.0); Range(-1.0, 1.0); UiGroup("Wrinkle/20"); >;
+
+    CreateInputTexture2D(TextureSquishColor, Srgb, 8, "", "_color", "Color/11", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureStretchColor, Srgb, 8, "", "_color", "Color/12", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureSquishNormal, Linear, 8, "NormalizeNormals", "_normal", "Normal/21", Default3(0.5, 0.5, 1.0));
+    CreateInputTexture2D(TextureStretchNormal, Linear, 8, "NormalizeNormals", "_normal", "Normal/22", Default3(0.5, 0.5, 1.0));
+    CreateInputTexture2D(TextureSquishAmbientOcclusion, Linear, 8, "", "_ao", "Ambient Occlusion/11", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureStretchAmbientOcclusion, Linear, 8, "", "_ao", "Ambient Occlusion/12", Default3(1.0, 1.0, 1.0));
+
+    Texture2D g_tSquishColor < Channel(RGB, Box(TextureSquishColor), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    Texture2D g_tStretchColor < Channel(RGB, Box(TextureStretchColor), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    Texture2D g_tSquishNormal < Channel(RGBA, HemiOctIsoRoughness_RG_B(TextureSquishNormal, TextureRoughness), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    Texture2D g_tStretchNormal < Channel(RGBA, HemiOctIsoRoughness_RG_B(TextureStretchNormal, TextureRoughness), Linear); OutputFormat(BC7); SrgbRead(false); >;
+    Texture2D g_tSquishAmbientOcclusion < Channel(R, Box3(TextureSquishAmbientOcclusion), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+    Texture2D g_tStretchAmbientOcclusion < Channel(R, Box3(TextureStretchAmbientOcclusion), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    // ------------------------------------------------------------------------------------------ self illumination
+    // vr_complex's names, defaults and feature (F_SELF_ILLUM), so a vr_complex material glows as it did. Unlike
+    // vr_complex it goes with every other choice (vr_complex forbids it with a detail texture). Off, the mask is
+    // not read.
+    float g_flSelfIllumOn < Default(0.0); >;
+    float3 g_vSelfIllumTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Self Illum,60/20"); UiFeature(F_SELF_ILLUM); >;
+    float g_flSelfIllumBrightness < UiType(Slider); Default(0.0); Range(-10.0, 20.0); UiGroup("Self Illum,60/25"); UiFeature(F_SELF_ILLUM); >;
+    float g_flSelfIllumScale < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Self Illum,60/30"); UiFeature(F_SELF_ILLUM); >;
+    float2 g_vSelfIllumScrollSpeed < UiType(VectorText); Default2(0.0, 0.0); Range2(-10.0, -10.0, 10.0, 10.0); UiGroup("Self Illum,60/40"); UiFeature(F_SELF_ILLUM); >;
+    float g_flSelfIllumAlbedoFactor < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Self Illum,60/50"); UiFeature(F_SELF_ILLUM); >;
+
+    CreateInputTexture2D(TextureSelfIllumMask, Srgb, 8, "", "_selfillum", "Self Illum,60/10", Default3(0.0, 0.0, 0.0));
+    Texture2D g_tSelfIllumMask < Channel(RGB, Box(TextureSelfIllumMask), Srgb); OutputFormat(DXT1); SrgbRead(true); UiFeature(F_SELF_ILLUM); >;
+
+    // ------------------------------------------------------------------------------------------ clear coat
+    // Not in vr_complex: Blender's coat (amount, roughness, IOR, tint, normal) over the whole material (F_CLEARCOAT),
+    // with every other choice. The mask says where the coat is (white: all of it). The coat lies smooth over the
+    // normal map unless Clearcoat Normal Map is ticked (it follows the surface's), or it has one of its own
+    // (Clearcoat Own Normal Map: orange peel, scratches, raindrops on a lacquer), at its own strength. Its tint
+    // deepens where it is looked through at a slant.
+    float g_flClearcoatOn < Default(0.0); >;
+    float g_flClearcoat < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Clearcoat,55/20"); UiFeature(F_CLEARCOAT); >;
+    float g_flClearcoatRoughness < UiType(Slider); Default(0.03); Range(0.0, 1.0); UiGroup("Clearcoat,55/30"); UiFeature(F_CLEARCOAT); >;
+    float g_flClearcoatIor < UiType(Slider); Default(1.5); Range(1.0, 2.5); UiGroup("Clearcoat,55/40"); UiFeature(F_CLEARCOAT); >;
+    float3 g_vClearcoatTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Clearcoat,55/50"); UiFeature(F_CLEARCOAT); >;
+    bool g_bClearcoatNormalMap < UiType(CheckBox); Default(0); UiGroup("Clearcoat,55/60"); UiFeature(F_CLEARCOAT); >;
+    bool g_bClearcoatOwnNormalMap < UiType(CheckBox); Default(0); UiGroup("Clearcoat,55/70"); UiFeature(F_CLEARCOAT); >;
+    float g_flClearcoatNormalStrength < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Clearcoat,55/80"); UiFeature(F_CLEARCOAT); >;
+    CreateInputTexture2D(TextureClearcoatNormal, Linear, 8, "NormalizeNormals", "_normal", "Clearcoat,55/75", Default3(0.5, 0.5, 1.0));
+    Texture2D g_tClearcoatNormal < Channel(RG, HemiOctIsoRoughness_RG_B(TextureClearcoatNormal), Linear); OutputFormat(ATI2N); SrgbRead(false); UiFeature(F_CLEARCOAT); >;
+
+    // The suffix picks the Material Editor's stand in when no texture is given (materials/default/default<suffix>.tga):
+    // "_mask" is white; one with no file of its own gets default.tga, a mid grey, and the coat would be half there.
+    CreateInputTexture2D(TextureClearcoatMask, Linear, 8, "", "_mask", "Clearcoat,55/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tClearcoatMask < Channel(R, Box(TextureClearcoatMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_CLEARCOAT); >;
+
+    // ------------------------------------------------------------------------------------------ sheen
+    // Not in vr_complex: Blender's sheen (weight, tint, roughness), the soft light on velvet, cloth and dust at
+    // grazing angles (F_SHEEN); the mask says where it is (white: everywhere).
+    float g_flSheenOn < Default(0.0); >;
+    float g_flSheen < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Sheen,57/20"); UiFeature(F_SHEEN); >;
+    float3 g_vSheenTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Sheen,57/30"); UiFeature(F_SHEEN); >;
+    float g_flSheenRoughness < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Sheen,57/40"); UiFeature(F_SHEEN); >;
+
+    CreateInputTexture2D(TextureSheenMask, Linear, 8, "", "_mask", "Sheen,57/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tSheenMask < Channel(R, Box(TextureSheenMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_SHEEN); >;
+
+    // ------------------------------------------------------------------------------------------ anisotropy
+    // Blender's anisotropy (amount, rotation) instead of vr_complex's F_ANISOTROPIC_GLOSS: the highlights and the
+    // reflection stretch along the mesh's uv tangent, turned by the rotation (0..1 a full turn) plus the rotation
+    // map (black: none; for circular brushing). The mask says where (white: everywhere). F_ANISOTROPY.
+    float g_flAnisotropyOn < Default(0.0); >;
+    float g_flAnisotropic < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Anisotropic,58/20"); UiFeature(F_ANISOTROPY); >;
+    float g_flAnisotropicRotation < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Anisotropic,58/30"); UiFeature(F_ANISOTROPY); >;
+
+    CreateInputTexture2D(TextureAnisotropicMask, Linear, 8, "", "_mask", "Anisotropic,58/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureAnisotropicRotation, Linear, 8, "", "_black_mask", "Anisotropic,58/40", Default3(0.0, 0.0, 0.0));
+    Texture2D g_tAnisotropicMask < Channel(R, Box(TextureAnisotropicMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_ANISOTROPY); >;
+    Texture2D g_tAnisotropicRotation < Channel(R, Box(TextureAnisotropicRotation), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_ANISOTROPY); >;
+
+    // ------------------------------------------------------------------------------------------ subsurface
+    // Blender's subsurface scattering (weight, radius per channel, scale; Christensen-Burley) over the colour: light
+    // spreads under the surface, red farthest by default, softening the light's edge and the normal map's detail.
+    // The scale is in world units (Blender's default 0.05 m is about 2). The mask says where (white: everywhere).
+    // F_SUBSURFACE.
+    float g_flSubsurfaceOn < Default(0.0); >;
+    float g_flSubsurface < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Subsurface,56/20"); UiFeature(F_SUBSURFACE); >;
+    float3 g_vSubsurfaceRadius < UiType(VectorText); Default3(1.0, 0.2, 0.1); Range3(0.0, 0.0, 0.0, 50.0, 50.0, 50.0); UiGroup("Subsurface,56/30"); UiFeature(F_SUBSURFACE); >;
+    float g_flSubsurfaceScale < UiType(Slider); Default(2.0); Range(0.0, 250.0); UiGroup("Subsurface,56/40"); UiFeature(F_SUBSURFACE); >;
+
+    CreateInputTexture2D(TextureSubsurfaceMask, Linear, 8, "", "_mask", "Subsurface,56/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tSubsurfaceMask < Channel(R, Box(TextureSubsurfaceMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_SUBSURFACE); >;
+
+    // ------------------------------------------------------------------------------------------ special effects
+    float g_flPearlescenceOn < Default(0.0); >;
+    float g_flIridescenceOn < Default(0.0); >;
+    float g_flGlitterOn < Default(0.0); >;
+    float g_flHolographicOn < Default(0.0); >;
+
+    // Pearlescence: the colour's hue turns as the surface turns away from the eye, as pearl and the colour shifting
+    // paints do. Scale is the turn, in radians, seen edge on (6: almost a whole circle, a rainbow over a rounded
+    // shape); its sign is the way round (from red, + goes to yellow and green, - to pink and blue). The mask says
+    // where (white: all of it, black: none, grey: some).
+    float g_flPearlescentScale < UiType(Slider); Default(2.0); Range(-30.0, 30.0); UiGroup("Pearlescence,62/20"); UiFeature(F_PEARLESCENCE); >;
+
+    CreateInputTexture2D(TexturePearlescenceMask, Linear, 8, "", "_mask", "Pearlescence,62/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tPearlescenceMask < Channel(R, Box(TexturePearlescenceMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_PEARLESCENCE); >;
+
+    // The colour's hue turned by angle (radians) round the grey axis: its grey part (the mean) is kept, and the rest,
+    // which lies in the plane across that axis, is turned in it. In that plane red sits at 30 degrees and green at
+    // 150, so a positive angle goes from red to green. A colour near grey has no hue to speak of and is left as it
+    // is (else noise in a grey texture would turn into speckles of colour).
+    float3 TurnHue(float3 c, float angle)
+    {
+        const float grey = (c.r + c.g + c.b) / 3.0;
+        const float3 hue = c - grey;
+        const float3 u = float3(1.0, -1.0, 0.0) * 0.70710678;          // across the grey axis
+        const float3 w = float3(1.0, 1.0, -2.0) * 0.40824829;          // across it and u
+        const float2 p = float2(dot(hue, u), dot(hue, w));
+        float s, k;
+        sincos(angle, s, k);
+        const float2 q = float2(p.x * k - p.y * s, p.x * s + p.y * k);
+        const float3 turned = max(grey + q.x * u + q.y * w, 0.0);
+        const float top = max(c.r, max(c.g, c.b));
+        const float saturation = top > 1e-4 ? (top - min(c.r, min(c.g, c.b))) / top : 0.0;
+        return lerp(c, turned, smoothstep(0.02, 0.2, saturation));
+    }
+
+    // Iridescence: a thin transparent film on the surface (oil, soap, the blue of heated steel), as Blender's
+    // thin film has it. Light reflected off the film's top and off the surface under it interferes, so the
+    // reflection takes colours that change with the film's thickness and the angle. The thickness map (as
+    // Blender's thin film takes its thickness from a texture) goes from Thickness Min (black) to Thickness (white),
+    // in nanometres: 0 is no film, 200..1000 the bright bands, and a map that wanders between them draws the bands
+    // and swirls of oil on water. No map: Thickness all over. The film's index of refraction: soap and water 1.33,
+    // oxide on heated metal about 2.
+    float g_flThinFilmThicknessMin < UiType(Slider); Default(0.0); Range(0.0, 5000.0); UiGroup("Iridescence,63/15"); UiFeature(F_IRIDESCENCE); >;
+    float g_flThinFilmThickness < UiType(Slider); Default(400.0); Range(0.0, 5000.0); UiGroup("Iridescence,63/20"); UiFeature(F_IRIDESCENCE); >;
+    float g_flThinFilmIor < UiType(Slider); Default(1.33); Range(1.0, 3.0); UiGroup("Iridescence,63/30"); UiFeature(F_IRIDESCENCE); >;
+
+    CreateInputTexture2D(TextureThinFilmThickness, Linear, 8, "", "_mask", "Iridescence,63/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tThinFilmThickness < Channel(R, Box(TextureThinFilmThickness), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_IRIDESCENCE); >;
+
+    // The fraction of light a film reflects at one wavelength, for one polarisation: r12 and r23 the amplitude
+    // reflections at its top and bottom, phase the delay of the bottom one. Airy's sum of every bounce inside.
+    float Airy(float r12, float r23, float phase)
+    {
+        const float k = 2.0 * r12 * r23 * cos(phase);
+        return saturate((r12 * r12 + r23 * r23 + k) / (1.0 + r12 * r12 * r23 * r23 + k));
+    }
+
+    // Fresnel's amplitude reflections (s and p) going from index n1 to n2, with the cosines on each side.
+    float2 Amplitudes(float n1, float n2, float c1, float c2)
+    {
+        return float2((n1 * c1 - n2 * c2) / (n1 * c1 + n2 * c2), (n2 * c1 - n1 * c2) / (n2 * c1 + n1 * c2));
+    }
+
+    // The film's reflection colour seen at cosTheta (n.v), over a base whose F0 is f0: the spectrum at 16
+    // wavelengths, 400..700 nm, through the colour matching functions (spectrum.hlsl) to linear sRGB, scaled so that a flat
+    // spectrum of 1 is white. The base's index per channel comes from its F0 (blue at 450 nm, green 530, red 610,
+    // between them by wavelength).
+    float3 ThinFilm(float3 f0, float cosTheta, float thickness, float filmIor)
+    {
+        const float3 root = sqrt(clamp(f0, 0.0, 0.99));
+        const float3 baseIor = (1.0 + root) / (1.0 - root);
+        const float c1 = saturate(cosTheta);
+        const float s2 = (1.0 - c1 * c1) / (filmIor * filmIor);
+        const float c2 = sqrt(saturate(1.0 - s2));
+        float3 xyz = 0.0, white = 0.0, bare = 0.0;
+        [loop] for (int k = 0; k < 16; k++)
+        {
+            const float l = 400.0 + 20.0 * k;
+            const float n3 = l < 530.0 ? lerp(baseIor.b, baseIor.g, saturate((l - 450.0) / 80.0))
+                                       : lerp(baseIor.g, baseIor.r, saturate((l - 530.0) / 80.0));
+            const float c3 = sqrt(saturate(1.0 - (1.0 - c1 * c1) / (n3 * n3)));
+            const float2 r12 = Amplitudes(1.0, filmIor, c1, c2);
+            const float2 r23 = Amplitudes(filmIor, n3, c2, c3);
+            const float phase = 6.2831853 * 2.0 * filmIor * thickness * c2 / l;
+            const float r = 0.5 * (Airy(r12.x, r23.x, phase) + Airy(r12.y, r23.y, phase));
+            const float3 cmf = ColourMatching(l);
+            xyz += r * cmf;
+            white += cmf;
+            const float face = (n3 - 1.0) / (n3 + 1.0);
+            bare += face * face * cmf;      // the base alone, face on
+        }
+        const float3 w = max(mul(g_XyzToRgb, white), 1e-4);
+        // Spreading the three channels' indices over the spectrum tints a coloured base a little: scaled back so
+        // that the base alone, face on, comes out as its own F0.
+        const float3 alone = max(mul(g_XyzToRgb, bare) / w, 1e-4);
+        return max(mul(g_XyzToRgb, xyz) / w, 0.0) * clamp(f0, 0.0, 0.99) / alone;
+    }
+
+    // Glitter: mirror flakes scattered through the surface, as in metal flake paint and glitter, each tilted its own
+    // way so each catches the light at its own angle. Density is how many flakes across the texture (uv 0..1),
+    // Coverage the share of the surface that is flake, Spread how far they tilt (1: up to 45 degrees), Roughness
+    // each flake's own. The flakes are metal of the Tint colour. The mask says where (white: everywhere). Seen from
+    // so far that a flake is under a pixel, they fade into the soft sheen they average to, so they do not flicker.
+    float g_flGlitter < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Glitter,64/20"); UiFeature(F_GLITTER); >;
+    float g_flGlitterDensity < UiType(Slider); Default(300.0); Range(1.0, 20000.0); UiGroup("Glitter,64/30"); UiFeature(F_GLITTER); >;
+    float g_flGlitterCoverage < UiType(Slider); Default(0.2); Range(0.0, 1.0); UiGroup("Glitter,64/40"); UiFeature(F_GLITTER); >;
+    float g_flGlitterSpread < UiType(Slider); Default(0.5); Range(0.0, 1.0); UiGroup("Glitter,64/50"); UiFeature(F_GLITTER); >;
+    float g_flGlitterRoughness < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Glitter,64/60"); UiFeature(F_GLITTER); >;
+    float3 g_vGlitterTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Glitter,64/70"); UiFeature(F_GLITTER); >;
+
+    CreateInputTexture2D(TextureGlitterMask, Linear, 8, "", "_mask", "Glitter,64/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tGlitterMask < Channel(R, Box(TextureGlitterMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_GLITTER); >;
+
+    // Holographic: a foil pressed with fine grooves (holographic stickers, the back of a CD), which splits the
+    // lights and the bright parts of the surroundings into rainbows. Spacing is the grooves' spacing in nanometres:
+    // small fans the colours out wide, large keeps them close to the reflection. Roughness spreads the rainbows
+    // sideways (a soft sheen instead of thin lines). Rotation turns the grooves about the normal (0..1 a full turn)
+    // from the mesh's uv direction, and the rotation map adds its own turn per texel: patches of different turn
+    // light up at different angles, the pattern of a holographic sticker. The mask says where.
+    float g_flHolographic < UiType(Slider); Default(1.0); Range(0.0, 5.0); UiGroup("Holographic,65/20"); UiFeature(F_HOLOGRAPHIC); >;
+    float g_flHolographicSpacing < UiType(Slider); Default(1600.0); Range(400.0, 20000.0); UiGroup("Holographic,65/30"); UiFeature(F_HOLOGRAPHIC); >;
+    float g_flHolographicRoughness < UiType(Slider); Default(0.1); Range(0.0, 1.0); UiGroup("Holographic,65/40"); UiFeature(F_HOLOGRAPHIC); >;
+    float g_flHolographicRotation < UiType(Slider); Default(0.0); Range(0.0, 1.0); UiGroup("Holographic,65/50"); UiFeature(F_HOLOGRAPHIC); >;
+
+    CreateInputTexture2D(TextureHolographicMask, Linear, 8, "", "_mask", "Holographic,65/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureHolographicRotation, Linear, 8, "", "_black_mask", "Holographic,65/12", Default3(0.0, 0.0, 0.0));
+    Texture2D g_tHolographicMask < Channel(R, Box(TextureHolographicMask), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_HOLOGRAPHIC); >;
+    Texture2D g_tHolographicRotation < Channel(R, Box(TextureHolographicRotation), Linear); OutputFormat(ATI1N); SrgbRead(false); UiFeature(F_HOLOGRAPHIC); >;
+
+    // A cell's random numbers (PCG), each in 0..1.
+    uint FlakeHash(uint2 c)
+    {
+        uint h = c.x * 747796405u + c.y * 2891336453u + 277803737u;
+        h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+        return (h >> 22u) ^ h;
+    }
+
+    float4 FlakeRandom(int2 cell)
+    {
+        const uint h = FlakeHash(asuint(cell));
+        const uint h2 = FlakeHash(uint2(h, 0x9e3779b9u));
+        return float4(h & 0xffffu, h >> 16u, h2 & 0xffffu, h2 >> 16u) / 65535.0;
+    }
+
+    // The flake under this pixel: the flakes are the cells of a Voronoi pattern in uv (one jittered point per grid
+    // cell, the nearest point's cell is the flake), so they are packed edge to edge with uneven shapes and sizes.
+    // Returns the flake's tilt (across the tangent and the bitangent) in xy and whether there is a flake in z.
+    float3 Flake(float2 uv, float density, float coverage, float spread)
+    {
+        const float2 p = uv * density;
+        const int2 cell = (int2)floor(p);
+        float best = 1e9;
+        int2 nearest = cell;
+        [loop] for (int y = -1; y <= 1; y++)
+            [loop] for (int x = -1; x <= 1; x++)
+            {
+                const int2 c = cell + int2(x, y);
+                const float2 d = (float2)c + FlakeRandom(c).xy - p;
+                const float d2 = dot(d, d);
+                if (d2 < best)
+                {
+                    best = d2;
+                    nearest = c;
+                }
+            }
+        const float4 r = FlakeRandom(nearest + int2(7919, 104729));
+        float sn, cs;
+        sincos(r.x * 6.28318531, sn, cs);
+        return float3(float2(cs, sn) * sqrt(r.y) * spread, r.z < coverage ? 1.0 : 0.0);
+    }
+
+    float3 Pearlescence(float3 albedo, float3 normalWs, float3 toEye, float scale)
+    {
+        const float edgeOn = 1.0 - saturate(dot(normalWs, toEye));
+        return TurnHue(albedo, edgeOn * scale);
+    }
+
+    // The uv a texture reads: the mesh's second one when the material has F_SECONDARY_UV and the texture's checkbox
+    // asks for it, else the one given.
+    float2 UvFor(PixelInput i, float2 uv, bool secondary)
+    {
+        return g_nSecondaryUv != 0 && secondary ? i.vTexCoord2 : uv;
+    }
+
+    float SurfaceOpacity(float2 uv)
+    {
+        return saturate(g_tTranslucency.Sample(g_sColor, uv).r * g_flOpacityScale);
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+        // The shadows (and the depth pass) cut the surface as the screen does: alpha test at its reference, a
+        // translucent surface where it is less than half there.
+        if (g_nAlphaTest != 0 || g_nTranslucent != 0)
+        {
+            const float2 uv = TexCoordTransform(i.vTexCoord, g_vTexCoordScale, g_vTexCoordOffset, g_vTexCoordScrollSpeed);
+            clip(SurfaceOpacity(uv) - (g_nAlphaTest != 0 ? g_flAlphaTestReference : 0.5));
+        }
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float2 uv = TexCoordTransform(i.vTexCoord, g_vTexCoordScale, g_vTexCoordOffset, g_vTexCoordScrollSpeed);
+        // See-through: cut first, so a cut pixel costs nothing more.
+        float alpha = 1.0;
+        if (g_nAlphaTest != 0 || g_nTranslucent != 0 || g_nAdditive != 0)
+            alpha = SurfaceOpacity(uv);
+        if (g_nAlphaTest != 0)
+        {
+            clip(alpha - g_flAlphaTestReference);
+            if (g_nTranslucent == 0 && g_nAdditive == 0)
+                alpha = 1.0;
+        }
+        float3 color = g_tColor.Sample(g_sColor, uv).rgb;
+        float4 normalTexel = g_tNormal.Sample(g_sColor, uv);
+        const float2 aoUv = UvFor(i, uv, g_bUseSecondaryUvForAmbientOcclusion);
+        float occlusion = g_tAmbientOcclusion.Sample(g_sColor, aoUv).r;
+    #if S_WRINKLE
+        // The flexes squish or stretch the skin: each map blends toward its squish or stretch version.
+        const float wrinkle = Wrinkle(i, g_bWrinkleOverride, g_flWrinkleOverride);
+        color = WrinkleBlend(float4(color, 0.0), float4(g_tSquishColor.Sample(g_sColor, uv).rgb, 0.0),
+                             float4(g_tStretchColor.Sample(g_sColor, uv).rgb, 0.0), wrinkle).rgb;
+        normalTexel = WrinkleBlend(normalTexel, g_tSquishNormal.Sample(g_sColor, uv), g_tStretchNormal.Sample(g_sColor, uv), wrinkle);
+        occlusion = WrinkleBlend(occlusion.xxxx, g_tSquishAmbientOcclusion.Sample(g_sColor, aoUv).rrrr,
+                                 g_tStretchAmbientOcclusion.Sample(g_sColor, aoUv).rrrr, wrinkle).x;
+    #endif
+        const float tintMask = g_nTintMask != 0 ? g_tTintMask.Sample(g_sColor, UvFor(i, uv, g_bUseSecondaryUvForTintMask)).r : 1.0;
+        float3 albedo = color * ModelTint(g_vColorTint, i.vTint.rgb, g_flModelTintAmount, tintMask);
+        float3 normal = ScaleNormal(DecodeNormal(normalTexel.rg), g_flNormalMapScaleFactor);
+        const float roughness = lerp(g_flRoughnessRemapMin, g_flRoughnessRemapMax, normalTexel.b);
+        // The remap only with the texture: its sliders belong to F_METALNESS_TEXTURE, and a material without it does
+        // not write them (they read 0 there, and every metal of the slider came out as no metal at all).
+        const float metalness = g_flMetalnessTextureOn > 0.5
+                                    ? lerp(g_flMetalnessRemapMin, g_flMetalnessRemapMax, g_tMetalness.Sample(g_sColor, uv).r)
+                                    : g_flMetalness;
+    #if S_DETAIL_TEXTURE
+        // The detail's own uv starts from the mesh's (vr_complex's: not moved by the texture coordinates), or its
+        // second one.
+        const float detail = DetailAmount(g_tDetailMask.Sample(g_sColor, UvFor(i, uv, g_bUseSecondaryUvForDetailMask)).r,
+                                          g_flDetailBlendFactor, g_flDetailBlendToFull);
+        const float2 detailUv = DetailUv(UvFor(i, i.vTexCoord, g_bUseSecondaryUvForDetailTexture), g_vDetailTexCoordScale,
+                                         g_vDetailTexCoordOffset, g_flDetailTexCoordRotation);
+      #if S_DETAIL_TEXTURE == 1
+        albedo = DetailMod2X(albedo, g_tDetail.Sample(g_sColor, detailUv).rgb, detail);
+      #elif S_DETAIL_TEXTURE == 2 || S_DETAIL_TEXTURE == 4
+        albedo = DetailOverlay(albedo, g_tDetail.Sample(g_sColor, detailUv).rgb, detail);
+      #endif
+      #if S_DETAIL_TEXTURE >= 3
+        normal = DetailNormal(normal, DecodeNormal(g_tNormalDetail.Sample(g_sColor, detailUv).rg), g_flDetailNormalStrength, detail);
+      #endif
+    #endif
+        // Both sides drawn: the back face is lit from its own side (turned before the normal map is laid on).
+        PixelInput frame = i;
+    #if S_RENDER_BACKFACES
+        if (dot(i.vNormalWs.xyz, g_vCameraPositionWs - WorldPosition(i.vPositionWs)) < 0.0)
+            frame.vNormalWs.xyz = -i.vNormalWs.xyz;
+    #endif
+        const float3 normalWs = NormalToWorld(frame, normal);
+        // The base colour's hue, before the lighting: a metal's reflection takes it too.
+        if (g_flPearlescenceOn > 0.5)
+            albedo = Pearlescence(albedo, normalWs, normalize(g_vCameraPositionWs - WorldPosition(i.vPositionWs)),
+                                  g_flPearlescentScale * g_tPearlescenceMask.Sample(g_sColor, uv).r);
+        LightingSurface s = LitSurface(i, albedo, normalWs, roughness, metalness, occlusion);
+        SpecularLayer(s, albedo, metalness, g_flSpecularIor, g_flSpecularLevel, SrgbGammaToLinear(g_vSpecularTint));
+        s.diffuseRoughness = g_bDiffuseRoughnessFromRoughness ? saturate(roughness) : g_flDiffuseRoughness;
+        // The film's colour takes the reflection's place (F0), before the multiscatter energy is worked out from it
+        // (no film, 0 nm, gives the surface's own F0 back).
+        if (g_flIridescenceOn > 0.5)
+        {
+            const float3 toEye = normalize(g_vCameraPositionWs - WorldPosition(i.vPositionWs));
+            const float thickness = lerp(g_flThinFilmThicknessMin, g_flThinFilmThickness,
+                                         g_tThinFilmThickness.Sample(g_sColor, uv).r);
+            s.specularColor = ThinFilm(s.specularColor, dot(normalWs, toEye), thickness, g_flThinFilmIor);
+        }
+        if (g_flGlitterOn > 0.5)
+        {
+            // Flakes much smaller than a pixel average out: past one flake a pixel each turns into the mean, the
+            // shading normal with the flakes' tilt added to the roughness, covering the coverage's share.
+            const float3 flake = Flake(uv, g_flGlitterDensity, g_flGlitterCoverage, g_flGlitterSpread);
+            const float perPixel = length(fwidth(uv * g_flGlitterDensity));
+            const float far = smoothstep(0.5, 1.5, perPixel);
+            const float3 t = normalize(frame.vTangentWs - normalWs * dot(normalWs, frame.vTangentWs));
+            const float3 tilted = normalize(normalWs + flake.x * t + flake.y * cross(normalWs, t));
+            const float r = lerp(g_flGlitterRoughness,
+                                 sqrt(g_flGlitterRoughness * g_flGlitterRoughness + 0.5 * g_flGlitterSpread * g_flGlitterSpread), far);
+            Glitter(s, g_flGlitter * g_tGlitterMask.Sample(g_sColor, uv).r * lerp(flake.z, g_flGlitterCoverage, far),
+                    normalize(lerp(tilted, normalWs, far)), r, SrgbGammaToLinear(g_vGlitterTint));
+        }
+        if (g_flHolographicOn > 0.5)
+            Holographic(s, g_flHolographic * g_tHolographicMask.Sample(g_sColor, uv).r, g_flHolographicSpacing,
+                        g_flHolographicRoughness, g_flHolographicRotation + g_tHolographicRotation.Sample(g_sColor, uv).r,
+                        frame.vTangentWs);
+        DirectOcclusion(s, g_flAmbientOcclusionDirectDiffuse, g_flAmbientOcclusionDirectSpecular);
+        if (g_bMultiscatter)
+            SpecularEnergy(s);
+        if (g_flClearcoatOn > 0.5)
+        {
+            float3 coatNormal = g_bClearcoatNormalMap ? s.normalWs : frame.vNormalWs.xyz;
+            if (g_bClearcoatOwnNormalMap)
+                coatNormal = NormalToWorld(frame, ScaleNormal(DecodeNormal(g_tClearcoatNormal.Sample(g_sColor, uv).rg),
+                                                              g_flClearcoatNormalStrength));
+            Clearcoat(s, g_flClearcoat * g_tClearcoatMask.Sample(g_sColor, uv).r, g_flClearcoatRoughness, g_flClearcoatIor,
+                      SrgbGammaToLinear(g_vClearcoatTint), coatNormal);
+        }
+        if (g_flSubsurfaceOn > 0.5)
+        {
+            // Blender's d per channel; the curve's curvature from how fast the mesh's normal turns across the pixel;
+            // the normal map read at the mip whose texel is d wide, so each channel sees it blurred over its d.
+            const float3 d = max(g_vSubsurfaceRadius, 0.0) * g_flSubsurfaceScale * (0.25 / 3.14159265);
+            const float3 dp = fwidth(i.vPositionWs);
+            const float worldPerPixel = max(length(dp), 1e-6);
+            const float curvature = length(fwidth(normalize(frame.vNormalWs.xyz))) / worldPerPixel;
+            float2 size;
+            g_tNormal.GetDimensions(size.x, size.y);
+            const float worldPerTexel = worldPerPixel / max(length(fwidth(uv * size)), 1e-4);
+            const float3 mip = log2(max(d / worldPerTexel, 1.0));
+            float3 n[3];
+            [unroll] for (int c = 0; c < 3; c++)
+                n[c] = NormalToWorld(frame, ScaleNormal(DecodeNormal(g_tNormal.SampleLevel(g_sColor, uv, mip[c]).rg),
+                                                        g_flNormalMapScaleFactor));
+            Subsurface(s, g_flSubsurface * g_tSubsurfaceMask.Sample(g_sColor, uv).r, d, curvature, n[0], n[1], n[2]);
+        }
+        if (g_flAnisotropyOn > 0.5)
+            Anisotropy(s, g_flAnisotropic * g_tAnisotropicMask.Sample(g_sColor, uv).r,
+                       g_flAnisotropicRotation + g_tAnisotropicRotation.Sample(g_sColor, uv).r, frame.vTangentWs);
+        if (g_flSheenOn > 0.5)
+            Sheen(s, g_flSheen * g_tSheenMask.Sample(g_sColor, uv).r * SrgbGammaToLinear(g_vSheenTint), g_flSheenRoughness);
+    #if S2VFX_DEBUG_LIGHTING
+        // Test only: one term of the lighting as the colour (1 direct diffuse, 2 probe ambient (red: no probe),
+        // 3 environment map, 4 counts: lights / 8, projected lights / 4, sun cascades / 4, 5 all but the environment
+        // map, 6 the engine's switches: g_bIsSFM, g_bCubemapNormalization, g_bOtherFxEnabled.x, 7 the world normal,
+        // 8 the wrinkle amount: red squish, green stretch, 9 the normal map texel: red and green the normal, blue the
+        // roughness, 11 the ambient's occlusion: red the engine's dynamic AO, green the surface's total, blue the switch).
+        const DirectLight d = DirectLighting(s);
+        #if S2VFX_DEBUG_LIGHTING == 1
+        return float4(d.diffuse, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 2
+            #if D_BAKED_LIGHTING_FROM_PROBE
+        return float4(AmbientDiffuse(s), 1.0);
+            #else
+        return float4(1.0, 0.0, 0.0, 1.0);
+            #endif
+        #elif S2VFX_DEBUG_LIGHTING == 3
+        return float4(AmbientSpecular(s, AmbientDiffuse(s)), 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 5
+        return float4(s.diffuseColor * (AmbientDiffuse(s) * s.occlusion + d.diffuse) + d.specular * s.occlusion, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 6
+        return float4(g_bIsSFM ? 1.0 : 0.0, g_bCubemapNormalization ? 1.0 : 0.0, g_bOtherFxEnabled.x ? 1.0 : 0.0, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 7
+        return float4(s.normalWs * 0.5 + 0.5, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 8
+        return float4(saturate(-i.vNormalWs.w), saturate(i.vNormalWs.w), 0.0, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 9
+        return float4(normalTexel.rgb, 1.0);
+        #elif S2VFX_DEBUG_LIGHTING == 10
+        return float4(i.vTint.rgb, 1.0);        // with S2VFX_DEBUG_FRAME: what the vertex stage saw (vertex.hlsl)
+        #elif S2VFX_DEBUG_LIGHTING == 11
+        return float4(DynamicAmbientOcclusion(normalize(i.vNormalWs.xyz), i.vPositionPs), s.occlusion,
+                      g_bOtherFxEnabled.x ? 1.0 : 0.0, 1.0);
+        #else
+        return float4(g_vNumLights.x / 8.0, g_SFMLight_Count / 4.0, g_nSunShadowCascadeCount / 4.0, 1.0);
+        #endif
+    #endif
+        const DirectLight direct = DirectLighting(s);
+    #if S_SPECULAR
+        float3 result = ShadeSurface(s, direct);
+    #else
+        // As vr_complex without F_SPECULAR: no environment map reflection (the lights' specular stays).
+        float3 result = s.diffuseColor * (SurfaceAmbient(s) * DiffuseAlbedoWeight(s) * s.occlusion +
+                                          direct.diffuse * s.directDiffuseOcclusion) +
+                        direct.specular * s.directSpecularOcclusion * s.specularEnergy;
+    #endif
+        // The flakes and the foil lie under the clear coat, which reflects the environment map whatever F_SPECULAR
+        // says: a coat without it looks matte.
+        result = GlitterLayer(s, direct, result);
+        result = HoloLayer(s, direct, result);
+        result = CoatLayer(s, direct, result);
+        result = SheenLayer(s, direct, result);
+        if (g_flSelfIllumOn > 0.5)
+            result += SelfIllum(g_tSelfIllumMask, g_sColor, UvFor(i, uv, g_bUseSecondaryUvForSelfIllum), albedo,
+                                g_vSelfIllumTint, g_flSelfIllumBrightness, g_flSelfIllumScale, g_vSelfIllumScrollSpeed,
+                                g_flSelfIllumAlbedoFactor);
+        // Added light fades into the fog as the fog thickens, rather than turning the fog's colour.
+        if (g_nAdditive != 0)
+            result = ApplyFog(result, i.vPositionWs, i.vPositionPs.xy) - ApplyFog(0.0, i.vPositionWs, i.vPositionPs.xy);
+        else
+            result = ApplyFog(result, i.vPositionWs, i.vPositionPs.xy);
+        return float4(result, alpha);
+    }
+#endif
+}

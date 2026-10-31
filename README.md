@@ -19,7 +19,9 @@ All of it runs in one `dxgi.dll` placed beside the game (see [docs/why_dxgi.md](
 The [1.1.0 release](https://github.com/TVConstantine/S2FM_Mod_Pack/releases/tag/v1.1.0) also carries seven
 custom shaders for S2FM (lit, unlit, glass, water, energy, weather, sky) with example materials, texture sets and a
 manual (`Manual.html`), and the s2vfx compiler with its source, which builds shaders like them from `.vfx` files.
-The shaders and the compiler are under the BSD 3-Clause license too.
+Their source is in [s2vfx/](s2vfx/): the compiler (`src/`), the shaders (`examples/`, `include/`), the guide to
+writing one ([s2vfx/docs/writing_shaders.md](s2vfx/docs/writing_shaders.md)) and the scripts that make the example
+materials. The shaders and the compiler are under the BSD 3-Clause license too.
 
 User instructions are in [installer/README.txt](installer/README.txt), which ships in the package.
 
@@ -38,6 +40,7 @@ User instructions are in [installer/README.txt](installer/README.txt), which shi
 | `package/` | which features the core registers, the version |
 | `installer/` | `Install.bat`, `Uninstall.bat`, `s2fm_mods.ps1`, the user readme |
 | `tools/` | SDK setup, the package builder, the icon |
+| `s2vfx/` | the s2vfx shader compiler and the seven shaders, with its own [README](s2vfx/README.md) |
 | `tests/` | `installer_test.py`: install and uninstall on a test drive |
 
 ## Building

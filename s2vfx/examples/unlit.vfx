@@ -1,0 +1,135 @@
+// An unlit model shader: a colour texture times a tint colour and S2FM's model colour, with the map's fog. The
+// material's choices: both sides drawn, no shadow, a tint mask, the texture coordinates moved, scaled or scrolling,
+// and see-through: translucent (blended over what is behind), additive (added onto it, a glow) and alpha test (cut
+// out below a reference, in the shadows too). The see-through choices follow the material's features with no static
+// combo of their own: the blend and the depth write are render states the engine works out from them (as Valve's
+// vr_complex has its DstBlend), the code reads them as values (FeatureToInt).
+
+HEADER
+{
+    Description = "Unlit: a colour texture times a tint";
+}
+
+MODES
+{
+    VrForward();
+    Depth(S_MODE_DEPTH);
+    ToolsVis(S_MODE_TOOLS_VIS);
+    ToolsWireframe("vr_tools_wireframe.vfx");
+}
+
+FEATURES
+{
+    Feature(F_RENDER_BACKFACES, 0..1, "Rendering");
+    Feature(F_DO_NOT_CAST_SHADOWS, 0..1, "Rendering");
+    Feature(F_TRANSLUCENT, 0..1, "Translucent");
+    Feature(F_ADDITIVE_BLEND, 0..1, "Translucent");
+    Feature(F_ALPHA_TEST, 0..1, "Translucent");
+    Feature(F_TINT_MASK, 0..1, "Color");
+}
+
+COMMON
+{
+    #include "s2vfx/common.hlsl"
+}
+
+VS
+{
+    #include "s2vfx/vertex.hlsl"
+
+    PixelInput MainVs(VertexInput i)
+    {
+        return VertexMain(i);
+    }
+}
+
+PS
+{
+    // The depth pass draws with this shader's own vertex shader, and with this pixel shader only to cut out an alpha
+    // tested surface.
+    StaticCombo(S_MODE_DEPTH, 0..1, Sys(ALL));
+    StaticCombo(S_RENDER_BACKFACES, F_RENDER_BACKFACES, Sys(ALL));
+
+    RenderState(CullMode, S_RENDER_BACKFACES ? NONE : DEFAULT);
+    BoolAttribute(renderbackfaces, S_RENDER_BACKFACES ? true : false);
+
+    // See-through: blended (straight alpha), or added (the source's alpha still weighs it). Neither writes depth.
+    RenderState(BlendEnable, F_TRANSLUCENT || F_ADDITIVE_BLEND ? true : false);
+    RenderState(SrcBlend, SRC_ALPHA);
+    RenderState(DstBlend, F_ADDITIVE_BLEND ? ONE : INV_SRC_ALPHA);
+    RenderState(DepthWriteEnable, F_TRANSLUCENT || F_ADDITIVE_BLEND ? false : true);
+    BoolAttribute(translucent, F_TRANSLUCENT || F_ADDITIVE_BLEND ? true : false);
+    BoolAttribute(alphatest, F_ALPHA_TEST ? true : false);
+    BoolAttribute(NoZPrepass, F_TRANSLUCENT || F_ADDITIVE_BLEND || F_ALPHA_TEST ? true : false);
+    BoolAttribute(DoNotCastShadows, F_DO_NOT_CAST_SHADOWS || F_ADDITIVE_BLEND ? true : false);
+
+    #include "s2vfx/engine_lighting.hlsl"    // the fog's settings live in the lighting buffer
+    #include "s2vfx/fog.hlsl"
+    #include "s2vfx/material.hlsl"
+
+    int g_nTranslucent < FeatureToInt(F_TRANSLUCENT); >;
+    int g_nAdditive < FeatureToInt(F_ADDITIVE_BLEND); >;
+    int g_nAlphaTest < FeatureToInt(F_ALPHA_TEST); >;
+    int g_nTintMask < FeatureToInt(F_TINT_MASK); >;
+
+    // ------------------------------------------------------------------------------------------ colour
+    float3 g_vColorTint < UiType(Color); Default3(1.0, 1.0, 1.0); UiGroup("Color,10/20"); >;
+    float g_flModelTintAmount < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Color,10/30"); >;
+    // Brightness: the colour times 2 to this power (0: as it is), so an unlit surface can glow past white.
+    float g_flBrightness < UiType(Slider); Default(0.0); Range(-10.0, 20.0); UiGroup("Color,10/40"); >;
+
+    CreateInputTexture2D(TextureColor, Srgb, 8, "", "_color", "Color,10/10", Default3(1.0, 1.0, 1.0));
+    CreateInputTexture2D(TextureTintMask, Linear, 8, "", "_mask", "Color,10/50", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tColor < Channel(RGB, Box(TextureColor), Srgb); OutputFormat(DXT1); SrgbRead(true); >;
+    Texture2D g_tTintMask < Channel(R, Box(TextureTintMask), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+    SamplerState g_sColor < Filter(ANISOTROPIC); MaxAniso(8); AddressU(WRAP); AddressV(WRAP); >;
+
+    // ------------------------------------------------------------------------------------------ texture coordinates
+    float2 g_vTexCoordScale < UiType(VectorText); Default2(1.0, 1.0); Range2(0.0, 0.0, 500.0, 500.0); UiGroup("Texture Coordinates,80/10"); >;
+    float2 g_vTexCoordOffset < UiType(VectorText); Default2(0.0, 0.0); Range2(-10.0, -10.0, 10.0, 10.0); UiGroup("Texture Coordinates,80/20"); >;
+    float2 g_vTexCoordScrollSpeed < UiType(VectorText); Default2(0.0, 0.0); Range2(-50.0, -50.0, 50.0, 50.0); UiGroup("Texture Coordinates,80/30"); >;
+
+    // ------------------------------------------------------------------------------------------ translucent
+    float g_flOpacityScale < UiType(Slider); Default(1.0); Range(0.0, 1.0); UiGroup("Translucent,15/20"); >;
+    float g_flAlphaTestReference < UiType(Slider); Default(0.5); Range(0.01, 0.99); UiGroup("Translucent,15/30"); >;
+
+    CreateInputTexture2D(TextureTranslucency, Linear, 8, "", "_trans", "Translucent,15/10", Default3(1.0, 1.0, 1.0));
+    Texture2D g_tTranslucency < Channel(R, Box(TextureTranslucency), Linear); OutputFormat(ATI1N); SrgbRead(false); >;
+
+    float CutOpacity(float2 uv)
+    {
+        return saturate(g_tTranslucency.Sample(g_sColor, uv).r * g_flOpacityScale);
+    }
+
+#if S_MODE_DEPTH
+    void MainPs(PixelInput i)
+    {
+        if (g_nAlphaTest != 0)
+            clip(CutOpacity(TexCoordTransform(i.vTexCoord, g_vTexCoordScale, g_vTexCoordOffset, g_vTexCoordScrollSpeed)) -
+                 g_flAlphaTestReference);
+    }
+#else
+    float4 MainPs(PixelInput i) : SV_Target0
+    {
+        const float2 uv = TexCoordTransform(i.vTexCoord, g_vTexCoordScale, g_vTexCoordOffset, g_vTexCoordScrollSpeed);
+        const float mask = g_nTintMask != 0 ? g_tTintMask.Sample(g_sColor, uv).r : 1.0;
+        float3 color = g_tColor.Sample(g_sColor, uv).rgb * ModelTint(g_vColorTint, i.vTint.rgb, g_flModelTintAmount, mask) *
+                       exp2(g_flBrightness);
+        float alpha = 1.0;
+        if (g_nAlphaTest != 0 || g_nTranslucent != 0 || g_nAdditive != 0)
+            alpha = CutOpacity(uv);
+        if (g_nAlphaTest != 0)
+        {
+            clip(alpha - g_flAlphaTestReference);
+            if (g_nTranslucent == 0 && g_nAdditive == 0)
+                alpha = 1.0;
+        }
+        // Added light fades into the fog as the fog thickens, rather than turning the fog's colour.
+        if (g_nAdditive != 0)
+            color = ApplyFog(color, i.vPositionWs, i.vPositionPs.xy) - ApplyFog(0.0, i.vPositionWs, i.vPositionPs.xy);
+        else
+            color = ApplyFog(color, i.vPositionWs, i.vPositionPs.xy);
+        return float4(color, alpha);
+    }
+#endif
+}
